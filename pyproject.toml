@@ -1,0 +1,23 @@
+[project]
+name = "langchain-first"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "minuuoo", email = "minu0922@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "deepagents>=0.7.29",
+    "langchain>=1.4.6",
+    "langchain-google-genai>=4.4.2",
+    "langchain-ollama>=1.1.0",
+    "python-dotenv>=1.2.4",
+]
+
+[project.scripts]
+langchain-first = "langchain_first:main"
+
+[build-system]
+requires = ["uv_build>=0.13.4,<0.14.0"]
+build-backend = "uv_build"
