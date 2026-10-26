@@ -23,6 +23,8 @@ uv sync
 | `GCP_API_KEY` | `first_ex1.py`, `third.py`, `news_agent.py` | Vertex AI용 API 키 |
 | `GOOGLE_CLOUD_LOCATION` | 위와 동일 | Vertex AI 리전 (기본값 `us-central1`) |
 | `GOOGLE_API_KEY` | `main.py` | Gemini API 키 (`init_chat_model`의 `google-genai` 공급자) |
+| `GOOGLE_CSE_API_KEY` | `web_chat.py` | Custom Search JSON API 키 (검색 방식 "Custom Search (CSE)" 선택 시) |
+| `GOOGLE_CSE_ID` | `web_chat.py` | Programmable Search Engine ID (`cx`) |
 
 예제 코드는 `.env`를 자동으로 읽지 않으므로(`load_dotenv` 주석 처리) 셸에서 직접 export 하거나 uv의 `--env-file` 옵션을 사용합니다.
 
