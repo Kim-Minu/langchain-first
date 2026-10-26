@@ -13,6 +13,8 @@ from chat_app.config import (
     MODEL_OPTIONS,
     OUTPUT_TOKENS_MAX,
     OUTPUT_TOKENS_MIN,
+    REASONING_CAPTIONS,
+    REASONING_OPTIONS,
     SEARCH_CACHE_TTL_SECONDS,
     SEARCH_CAPTIONS,
     SEARCH_GROUNDING,
@@ -39,9 +41,17 @@ from chat_app.usage import (
     estimate_cost,
     is_truncated,
     searched_label,
+    sum_reasoning_tokens,
     sum_token_usage,
     used_code_execution,
 )
+from chat_app.weather import (
+    WEATHER_PATTERN,
+    extract_weather_query,
+    fetch_forecast,
+    weather_context,
+)
+from chat_app.weather_card import weather_card_html
 
 ASSISTANT_AVATAR = ":material/auto_awesome:"
 INPUT_PLACEHOLDER = "Gemini에게 물어보기"
@@ -117,6 +127,7 @@ def render_sidebar():
                 st.metric("누적 예상 비용", f"${totals['cost_usd']:.5f} (약 {totals['cost_usd'] * KRW_PER_USD:.2f}원)")
             else:
                 st.metric("누적 예상 비용", "$0.00 (무료)")
+            st.page_link("pages/usage_dashboard.py", label="사용량 대시보드 (일 · 주 · 월 × 모델)", icon=":material/bar_chart:")
 
             # LangGraph 캐시 (Vertex AI Grounding 답변)
             graph_cache = get_graph_cache()
@@ -159,14 +170,17 @@ class RunSettings:
     search_mode: str
     url_context: bool
     code_execution: bool
+    reasoning_effort: str
     max_output_tokens: int
     output_format: OutputFormat | None
+    weather_card: bool  # 에이전트와 무관한 화면 기능이라 agent_key에 넣지 않음
 
     def agent_key(self) -> str:
         """이 값이 바뀌면 에이전트를 새로 만듭니다."""
         fmt = self.output_format.canonical() if self.output_format else "none"
         return (
-            f"{self.model_choice}|{self.search_mode}|url={self.url_context}|code={self.code_execution}"
+            f"{self.model_choice}|reasoning={self.reasoning_effort}|{self.search_mode}"
+            f"|url={self.url_context}|code={self.code_execution}"
             f"|max={self.max_output_tokens}|format={fmt}"
         )
 
@@ -225,6 +239,17 @@ def render_settings_panel() -> RunSettings:
             key="model_choice",
         )
         is_gemma = "Gemma" in model_choice
+        reasoning_effort = st.radio(
+            "사고 수준",
+            options=list(REASONING_OPTIONS),
+            format_func=lambda key: REASONING_OPTIONS[key],
+            captions=REASONING_CAPTIONS,
+            key="reasoning_effort",
+            horizontal=False,
+            disabled=is_gemma,
+            help="Gemini가 답하기 전에 얼마나 깊이 생각할지 정합니다. 높을수록 복잡한 추론 · 계산에 강하지만 "
+            "추론 토큰이 늘어 응답이 느려지고 비용이 커질 수 있습니다. (Gemini 전용)",
+        )
 
         st.divider()
         search_mode = st.radio(
@@ -247,6 +272,13 @@ def render_settings_panel() -> RunSettings:
             key="code_execution_enabled",
             help="계산 · 데이터 처리 · 코드 작성 요청에 Gemini가 Python 코드를 직접 실행하고 결과를 확인한 뒤 답합니다. "
             "코드는 Google 샌드박스에서 실행되며 이 컴퓨터에서는 실행되지 않습니다. (Gemini 내장 도구)",
+        )
+        weather_card = st.toggle(
+            "날씨 카드",
+            value=True,
+            key="weather_card_enabled",
+            help="날씨를 물으면 장소를 찾아 Open-Meteo 예보로 현재 기온 · 시간별 온도/강수량/바람 카드를 답변 위에 표시합니다. "
+            "장소 추출에 모델을 한 번 더 호출하며, 그 토큰도 사용량에 합산됩니다.",
         )
         if is_gemma and (search_mode == SEARCH_GROUNDING or url_context or code_execution):
             st.caption(
@@ -273,8 +305,10 @@ def render_settings_panel() -> RunSettings:
         search_mode=search_mode,
         url_context=url_context and not is_gemma,
         code_execution=code_execution and not is_gemma,
+        reasoning_effort=reasoning_effort,
         max_output_tokens=max_output_tokens,
         output_format=output_format,
+        weather_card=weather_card,
     )
 
 
@@ -286,6 +320,11 @@ def render_meta(msg: dict):
     searched = msg.get("searched")
     search_info = f" · {searched} 반영" if isinstance(searched, str) and searched else ""
     meta_text = f"{MODEL_OPTIONS.get(msg['model'], msg['model'])}{search_info}"
+    if msg.get("reasoning_effort") in REASONING_OPTIONS:
+        reasoning_info = f" · 사고 수준 {REASONING_OPTIONS[msg['reasoning_effort']]}"
+        if msg.get("reasoning_tokens"):
+            reasoning_info += f" (추론 {msg['reasoning_tokens']:,} 토큰)"
+        meta_text += reasoning_info
     if msg.get("code_executed"):
         meta_text += " · ▶ 코드 실행"
     if msg.get("total_tokens", 0) > 0:
@@ -313,8 +352,10 @@ def render_hero():
 
 def render_conversation(messages: list[dict]):
     """저장된 대화를 그리고 하단 고정 입력창을 표시합니다."""
-    for msg in messages:
+    for i, msg in enumerate(messages):
         with st.chat_message(msg["role"], avatar=ASSISTANT_AVATAR if msg["role"] == "assistant" else None):
+            if msg.get("weather"):
+                st.html(weather_card_html(msg["weather"], uid=str(i)))
             st.markdown(msg["content"])
             if msg.get("model"):
                 render_meta(msg)
@@ -386,7 +427,23 @@ def _iter_ai_display(agent, user_input: str, config: dict, answer_parts: list[st
 URL_PATTERN = re.compile(r"https?://\S+")
 
 
-def stream_assistant_reply(agent, user_input: str, settings: RunSettings, search_active: bool):
+def _prepare_weather(weather_llm, user_input: str) -> tuple[dict | None, dict | None]:
+    """
+    날씨 질문이면 (Open-Meteo 예보, 장소 추출 호출의 사용량)을 반환합니다.
+    키워드가 없으면 모델을 호출하지 않고, 추출 · 조회에 실패하면 카드 없이 일반 답변으로 진행합니다.
+    """
+    if weather_llm is None or not WEATHER_PATTERN.search(user_input):
+        return None, None
+    usage = None
+    try:
+        query, usage = extract_weather_query(weather_llm, user_input)
+        return (fetch_forecast(query) if query else None), usage
+    except Exception as e:
+        st.caption(f"⚠️ 날씨 데이터를 불러오지 못해 일반 답변으로 진행합니다: {e}")
+        return None, usage
+
+
+def stream_assistant_reply(agent, user_input: str, settings: RunSettings, search_active: bool, weather_llm=None):
     thread_id = st.session_state.thread_id
     output_format = settings.output_format
     model_choice = settings.model_choice
@@ -402,6 +459,14 @@ def stream_assistant_reply(agent, user_input: str, settings: RunSettings, search
         else:
             thinking_label = "생각하는 중…"
         thinking = st.empty()
+        if weather_llm is not None and WEATHER_PATTERN.search(user_input):
+            thinking.markdown('<div class="gm-thinking">날씨 정보를 가져오는 중…</div>', unsafe_allow_html=True)
+        weather, weather_usage = _prepare_weather(weather_llm, user_input)
+        agent_input = user_input
+        if weather:
+            # 카드는 답변보다 먼저 표시하고, 같은 수치를 모델에도 참고 자료로 넘겨 요약이 카드와 일치하게 함
+            st.html(weather_card_html(weather, uid="live"))
+            agent_input = f"{user_input}\n\n{weather_context(weather)}"
         thinking.markdown(f'<div class="gm-thinking">{thinking_label}</div>', unsafe_allow_html=True)
 
         def clear_thinking_on_first_token(stream):
@@ -416,7 +481,7 @@ def stream_assistant_reply(agent, user_input: str, settings: RunSettings, search
             answer_slot = st.empty()
             with answer_slot.container():
                 streamed = st.write_stream(
-                    clear_thinking_on_first_token(_iter_ai_display(agent, user_input, agent_config, answer_parts))
+                    clear_thinking_on_first_token(_iter_ai_display(agent, agent_input, agent_config, answer_parts))
                 )
             thinking.empty()  # 응답이 비어 있는 경우에도 로딩 문구 제거
             display_text = streamed if isinstance(streamed, str) else "".join(map(str, streamed))
@@ -431,12 +496,22 @@ def stream_assistant_reply(agent, user_input: str, settings: RunSettings, search
 
             turn_messages = current_turn_messages(agent.get_state(agent_config).values.get("messages", []))
             in_tokens, out_tokens, total_tokens = sum_token_usage(turn_messages, user_input, response_text)
+            reasoning_tokens = sum_reasoning_tokens(turn_messages)
+            if weather_usage:
+                # 날씨 장소 추출 호출도 같은 모델의 사용량이므로 이번 턴에 합산
+                in_tokens += weather_usage.get("input_tokens", 0)
+                out_tokens += weather_usage.get("output_tokens", 0)
+                total_tokens += weather_usage.get("total_tokens", 0)
+                reasoning_tokens += (weather_usage.get("output_token_details") or {}).get("reasoning", 0) or 0
             cost_usd, cost_str = estimate_cost(model_choice, in_tokens, out_tokens)
 
             meta = {
                 "model": model_choice,
                 "searched": searched_label(search_active, turn_messages, url_read=reads_link),
                 "code_executed": used_code_execution(turn_messages),
+                # 사고 수준은 Gemini에만 적용되므로 Gemma 답변에는 기록하지 않음
+                "reasoning_effort": settings.reasoning_effort if "Gemini" in model_choice else None,
+                "reasoning_tokens": reasoning_tokens,
                 "in_tokens": in_tokens,
                 "out_tokens": out_tokens,
                 "total_tokens": total_tokens,
@@ -446,6 +521,8 @@ def stream_assistant_reply(agent, user_input: str, settings: RunSettings, search
                 "structured": output_format is not None,
                 "structured_ok": structured_ok,
             }
+            if weather:
+                meta["weather"] = weather
             render_meta(meta)
 
             # 화면용 메시지 DB 저장 (모델 대화 기억은 PostgresSaver가 이미 저장함)

@@ -8,12 +8,13 @@ from langgraph.cache.base import BaseCache
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from chat_app.config import (
-    GEMINI_MODEL,
+    DEFAULT_REASONING_EFFORT,
     GOOGLE_CLOUD_LOCATION,
     GOOGLE_CLOUD_PROJECT,
     MAX_OUTPUT_TOKENS,
     SEARCH_CACHE_TTL_SECONDS,
     SEARCH_GROUNDING,
+    gemini_model_id,
     is_gemini,
 )
 from chat_app.content_normalize import NormalizeContentMiddleware
@@ -39,17 +40,17 @@ CODE_EXECUTION_PROMPT = (
 )
 
 
-def _create_gemini_llm(max_output_tokens: int):
+def _create_gemini_llm(model_id: str, max_output_tokens: int, reasoning_effort: str = DEFAULT_REASONING_EFFORT):
     credentials, default_project = google.auth.default(
         scopes=["https://www.googleapis.com/auth/cloud-platform"]
     )
     return ChatGoogleGenerativeAI(
-        model=GEMINI_MODEL,
+        model=model_id,
         vertexai=True,
         credentials=credentials,
         project=GOOGLE_CLOUD_PROJECT or default_project,
         location=GOOGLE_CLOUD_LOCATION,
-        reasoning_effort="low",
+        reasoning_effort=reasoning_effort,  # 사고 수준: low / medium / high
         max_output_tokens=max_output_tokens,
         streaming=True,
         timeout=120,
@@ -64,6 +65,13 @@ def _create_ollama_llm(max_output_tokens: int):
     return ChatOllama(model="gemma4:e2b", temperature=0, num_predict=max_output_tokens)
 
 
+def create_llm(model_name: str, max_output_tokens: int, reasoning_effort: str = DEFAULT_REASONING_EFFORT):
+    """선택한 모델의 LLM 객체 (에이전트 본체 · 날씨 장소 추출 같은 보조 호출에 함께 사용)."""
+    if is_gemini(model_name):
+        return _create_gemini_llm(gemini_model_id(model_name), max_output_tokens, reasoning_effort)
+    return _create_ollama_llm(max_output_tokens)
+
+
 def create_agent_for_model(
     model_name: str,
     search_mode: str,
@@ -73,6 +81,7 @@ def create_agent_for_model(
     output_format: OutputFormat | None = None,
     url_context: bool = False,
     code_execution: bool = False,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
 ):
     """
     선택한 모델에 맞춰 LLM 객체를 생성하고, 검색 방식에 따라 에이전트를 빌드합니다.
@@ -80,6 +89,7 @@ def create_agent_for_model(
     - url_context: Gemini 내장 url_context 도구 (메시지 속 링크 페이지를 Gemini가 직접 읽음, Gemini 전용)
     - code_execution: Gemini 내장 code_execution 도구 (Google 샌드박스에서 Python 실행 후 결과 확인, Gemini 전용)
     - max_output_tokens: 답변 1회당 출력 토큰 상한 (Gemini: max_output_tokens, Ollama: num_predict)
+    - reasoning_effort: 사고 수준 low / medium / high (Gemini 전용, 추론 깊이 · 응답 시간 · 비용에 영향)
     - cache: LangGraph 캐시. 내장 도구(검색 · 링크 읽기) 사용 시 같은 맥락의 답변을 TTL 동안 재사용
     - output_format: 구조화된 출력 형식(원샷 JSON 예시 또는 '라벨 : 값' 텍스트 템플릿). 주어지면 예시에서 만든
       JSON Schema로 ProviderStrategy(모델 네이티브 구조화 출력)를 적용하고, 예시를 시스템 프롬프트에 원샷으로 넣음
@@ -87,10 +97,7 @@ def create_agent_for_model(
     use_grounding = search_mode == SEARCH_GROUNDING and is_gemini(model_name)
     use_url_context = url_context and is_gemini(model_name)
 
-    if is_gemini(model_name):
-        llm = _create_gemini_llm(max_output_tokens)
-    else:
-        llm = _create_ollama_llm(max_output_tokens)
+    llm = create_llm(model_name, max_output_tokens, reasoning_effort)
 
     system_prompt = BASE_SYSTEM_PROMPT
     tools: list[dict] = []
@@ -109,7 +116,15 @@ def create_agent_for_model(
         tools.append({"code_execution": {}})
         system_prompt += CODE_EXECUTION_PROMPT
     if tools and cache is not None and SEARCH_CACHE_TTL_SECONDS > 0:
-        middleware.append(GroundingCacheMiddleware(cache, SEARCH_CACHE_TTL_SECONDS, GEMINI_MODEL, max_output_tokens))
+        # 사고 수준이 다르면 답변 깊이도 달라지므로 캐시 키(모델 식별자)에 포함
+        middleware.append(
+            GroundingCacheMiddleware(
+                cache,
+                SEARCH_CACHE_TTL_SECONDS,
+                f"{gemini_model_id(model_name)}|reasoning={reasoning_effort}",
+                max_output_tokens,
+            )
+        )
     if tools:
         # 미들웨어는 앞쪽이 바깥쪽 → 모델에 가장 가까운 안쪽에 두어 캐시 · 체크포인트 모두 정규화된 메시지를 저장
         middleware.append(NormalizeContentMiddleware())

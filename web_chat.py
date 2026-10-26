@@ -8,7 +8,7 @@
     · 대화 화면: 사용자 말풍선(오른쪽) / AI 답변(왼쪽, 말풍선 없음) + 하단 입력창
 - 기능:
     1) Google 검색 방식 선택: 끄기 / Vertex AI Grounding (+ LangGraph 캐시로 같은 맥락의 답변 재사용)
-    2) 모델 선택 (Google Gemini Vertex AI & Ollama Gemma)
+    2) 모델 선택 (Google Gemini Vertex AI & Ollama Gemma) + 사고 수준(reasoning_effort: 낮음 / 보통 / 높음)
     3) 실시간 토큰 스트리밍 (Streaming)
     4) 대화 내역 PostgreSQL 저장 (PostgresSaver + 대화 목록 테이블) + 여러 대화(thread) 전환
     5) 토큰 사용량 및 예상 비용 표시
@@ -16,6 +16,8 @@
     7) 링크 읽기: 메시지 속 URL 페이지를 Gemini가 직접 읽음 (URL context)
        코드 실행: Gemini가 Python 코드를 Google 샌드박스에서 실행하고 결과 확인 (Code execution)
     8) 오른쪽 실행 설정 패널에서 모든 옵션 선택
+    9) 날씨 카드: 날씨 질문에 Open-Meteo 예보로 현재 · 시간별(온도/강수량/바람) 카드 표시
+    10) 토큰 사용량 대시보드 (pages/usage_dashboard.py): 일별 · 주별 · 월별 × 모델별 통계
 
 이 파일은 실행 진입점으로, 화면 흐름만 담고 기능은 chat_app/ 모듈에 나뉘어 있습니다.
 
@@ -26,8 +28,8 @@
 
 import streamlit as st
 
-from chat_app.agent import create_agent_for_model
-from chat_app.config import is_search_active
+from chat_app.agent import create_agent_for_model, create_llm
+from chat_app.config import WEATHER_EXTRACT_MAX_TOKENS, is_search_active
 from chat_app.db import get_checkpointer, get_graph_cache, load_messages
 from chat_app.state import init_session_state
 from chat_app.styles import inject_styles
@@ -82,11 +84,20 @@ if st.session_state.get("current_agent_key") != settings.agent_key():
             output_format=settings.output_format,
             url_context=settings.url_context,
             code_execution=settings.code_execution,
+            reasoning_effort=settings.reasoning_effort,
         )
     except ImportError:
         st.error("Ollama 모델을 사용하려면 터미널에서 `uv add langchain-ollama`를 먼저 실행해 주세요.")
         st.stop()
     st.session_state.current_agent_key = settings.agent_key()
+
+# 날씨 카드용 장소 추출 LLM (선택한 모델 · 낮은 사고 수준, 모델이 바뀔 때만 새로 생성)
+if st.session_state.get("weather_llm_model") != settings.model_choice:
+    try:
+        st.session_state.weather_llm = create_llm(settings.model_choice, WEATHER_EXTRACT_MAX_TOKENS, "low")
+    except ImportError:
+        st.session_state.weather_llm = None
+    st.session_state.weather_llm_model = settings.model_choice
 
 # 6. 첫 화면(중앙 입력창) / 대화 화면(하단 입력창)
 if not messages:
@@ -98,4 +109,5 @@ render_conversation(messages)
 # 7. 대기 중인 질문이 있으면 답변 스트리밍
 if user_input := st.session_state.pending_prompt:
     st.session_state.pending_prompt = None
-    stream_assistant_reply(st.session_state.agent, user_input, settings, search_active)
+    weather_llm = st.session_state.weather_llm if settings.weather_card else None
+    stream_assistant_reply(st.session_state.agent, user_input, settings, search_active, weather_llm)

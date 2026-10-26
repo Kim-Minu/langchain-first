@@ -7,3 +7,5 @@ textColor = "#e3e3e3"
 
 [client]
 toolbarMode = "minimal"
+# pages/의 대시보드는 사이드바 자동 목록 대신 "설정 및 사용량"의 링크로 엶 (Gemini 스타일 사이드바 유지)
+showSidebarNavigation = false
