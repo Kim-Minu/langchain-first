@@ -340,7 +340,7 @@ client.models.generate_content(
     <ul>
       <li><strong>현재:</strong> 검색 방식 "Vertex AI Grounding"이 <em>Grounding with Google Search</em>입니다. 모델이 <code>gemini-3.8-flash</code>이므로 월 5,000 쿼리 이후 $14 / 1,000 쿼리가 붙는데, 화면의 예상 비용은 토큰 요금만 계산하고 있습니다.</li>
       <li><strong>표시 의무 미충족:</strong> <code>searchEntryPoint</code> 검색 추천을 아직 렌더링하지 않습니다. 개인 실습을 넘어 공개한다면 먼저 추가해야 합니다.</li>
-      <li><strong>Vertex AI Search를 추가하려면:</strong> 데이터 스토어를 만든 뒤 검색 방식 옵션에 <code>retrieval.vertexAiSearch</code> 도구를 하나 더 붙이면 됩니다. 이 경우에도 CSE 같은 LangChain 함수 도구와는 같은 요청에 섞을 수 없다는 점에 주의하세요.</li>
+      <li><strong>Vertex AI Search를 추가하려면:</strong> 데이터 스토어를 만든 뒤 검색 방식 옵션에 <code>retrieval.vertexAiSearch</code> 도구를 하나 더 붙이면 됩니다. 이 경우에도 LangChain 함수 도구(<code>@tool</code>)와는 같은 요청에 섞을 수 없다는 점에 주의하세요.</li>
     </ul>
   </section>
 

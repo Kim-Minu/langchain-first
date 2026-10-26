@@ -1,0 +1,21 @@
+# web_chat.py 대화 내역 저장용 로컬 PostgreSQL
+# 실행: docker compose up -d   /   중지: docker compose down (데이터는 pgdata 볼륨에 유지)
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: langchain
+      POSTGRES_PASSWORD: langchain  # 로컬 개발 전용 계정
+      POSTGRES_DB: langchain_chat
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langchain -d langchain_chat"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
