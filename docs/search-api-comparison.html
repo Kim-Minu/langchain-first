@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GCP 검색 API 비교</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #ffffff;
+    --surface: #f0f4f9;
+    --surface-2: #e9eef6;
+    --border: #dde3ea;
+    --text: #1f1f1f;
+    --muted: #5f6368;
+    --web: #1a73e8;
+    --web-soft: #e8f0fe;
+    --data: #188038;
+    --data-soft: #e6f4ea;
+    --warn: #b06000;
+    --warn-soft: #fef7e0;
+    --code-bg: #f8f9fa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #131314;
+      --surface: #1e1f20;
+      --surface-2: #282a2c;
+      --border: #3c4043;
+      --text: #e3e3e3;
+      --muted: #9aa0a6;
+      --web: #8ab4f8;
+      --web-soft: rgba(138, 180, 248, 0.12);
+      --data: #81c995;
+      --data-soft: rgba(129, 201, 149, 0.12);
+      --warn: #fdd663;
+      --warn-soft: rgba(253, 214, 99, 0.1);
+      --code-bg: #1b1c1d;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #131314;
+    --surface: #1e1f20;
+    --surface-2: #282a2c;
+    --border: #3c4043;
+    --text: #e3e3e3;
+    --muted: #9aa0a6;
+    --web: #8ab4f8;
+    --web-soft: rgba(138, 180, 248, 0.12);
+    --data: #81c995;
+    --data-soft: rgba(129, 201, 149, 0.12);
+    --warn: #fdd663;
+    --warn-soft: rgba(253, 214, 99, 0.1);
+    --code-bg: #1b1c1d;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Google Sans', 'Noto Sans KR', -apple-system, sans-serif;
+    line-height: 1.7;
+    font-size: 16px;
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 48px 16px 80px; }
+  h1 { font-size: 2rem; font-weight: 500; margin: 0 0 8px; letter-spacing: -0.5px; }
+  h2 { font-size: 1.35rem; font-weight: 500; margin: 56px 0 16px; }
+  h3 { font-size: 1.05rem; font-weight: 500; margin: 0 0 8px; }
+  p { margin: 0 0 12px; }
+  a { color: var(--web); }
+  code, pre { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 0.85em; }
+  :not(pre) > code { background: var(--surface-2); padding: 1px 6px; border-radius: 6px; }
+  .lede { color: var(--muted); font-size: 1.05rem; }
+  .meta { color: var(--muted); font-size: 0.85rem; margin-top: 12px; }
+
+  .note {
+    background: var(--warn-soft);
+    border-left: 3px solid var(--warn);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.92rem;
+    margin: 24px 0 0;
+  }
+
+  /* 한눈에 보기 카드 */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .card { background: var(--surface); border-radius: 20px; padding: 24px; border-top: 4px solid; }
+  .card.web { border-color: var(--web); }
+  .card.data { border-color: var(--data); }
+  .card .tag { display: inline-block; font-size: 0.78rem; font-weight: 500; padding: 2px 10px; border-radius: 12px; margin-bottom: 10px; }
+  .card.web .tag { background: var(--web-soft); color: var(--web); }
+  .card.data .tag { background: var(--data-soft); color: var(--data); }
+  .card .oneliner { font-size: 1.05rem; font-weight: 500; margin-bottom: 8px; }
+  .card ul { margin: 8px 0 0; padding-left: 20px; color: var(--muted); font-size: 0.93rem; }
+
+  /* 동작 흐름 */
+  .flow { background: var(--surface); border-radius: 20px; padding: 20px 24px; margin-bottom: 12px; }
+  .flow-title { font-weight: 500; margin-bottom: 12px; }
+  .steps { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .step { background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 8px 14px; font-size: 0.9rem; }
+  .step.hl-web { border-color: var(--web); color: var(--web); }
+  .step.hl-data { border-color: var(--data); color: var(--data); }
+  .arrow { color: var(--muted); }
+
+  /* 비교표 */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 16px; }
+  table { border-collapse: collapse; width: 100%; min-width: 680px; font-size: 0.92rem; }
+  th, td { text-align: left; vertical-align: top; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  thead th { background: var(--surface); font-weight: 500; }
+  thead th.web { color: var(--web); }
+  thead th.data { color: var(--data); }
+  tbody th { font-weight: 500; width: 18%; color: var(--muted); white-space: nowrap; }
+  td ul { margin: 0; padding-left: 18px; }
+
+  /* 코드 */
+  .code-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .code-block { background: var(--code-bg); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
+  .code-block .label { padding: 10px 16px; font-size: 0.85rem; font-weight: 500; border-bottom: 1px solid var(--border); }
+  .code-block.web .label { color: var(--web); }
+  .code-block.data .label { color: var(--data); }
+  pre { margin: 0; padding: 16px; overflow-x: auto; line-height: 1.6; }
+  .cm { color: var(--muted); }
+
+  /* 선택 가이드 */
+  .guide { display: grid; gap: 10px; }
+  .guide-row { display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: center; background: var(--surface); border-radius: 14px; padding: 14px 18px; }
+  .pick { font-size: 0.85rem; font-weight: 500; padding: 4px 12px; border-radius: 12px; white-space: nowrap; }
+  .pick.web { background: var(--web-soft); color: var(--web); }
+  .pick.data { background: var(--data-soft); color: var(--data); }
+  .pick.both { background: var(--surface-2); color: var(--text); }
+  @media (max-width: 560px) {
+    .guide-row { grid-template-columns: 1fr; gap: 8px; }
+    .pick { justify-self: start; }
+  }
+
+  ol.sources { padding-left: 20px; font-size: 0.9rem; color: var(--muted); }
+  ol.sources li { margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<main>
+
+  <header>
+    <h1>GCP 검색 API 비교</h1>
+    <p class="lede">Gemini 답변의 근거를 어디서 가져올 것인가 — <strong>공개 웹</strong>(Grounding with Google Search)이냐, <strong>내 데이터</strong>(Vertex AI Search)냐.</p>
+    <p class="meta">기준일 2026-10-26 · Google Cloud 공식 문서 기준 · 요금은 변경될 수 있으므로 도입 전 공식 가격 페이지를 다시 확인하세요.</p>
+    <div class="note">
+      <strong>명칭 변경 안내</strong> — Vertex AI 플랫폼은 2026-04 리브랜딩으로 <strong>Gemini Enterprise Agent Platform</strong>이 되었고,
+      Vertex AI Search는 <strong>Agent Search</strong>로 이름이 바뀌는 중입니다. API 필드명(<code>vertexAiSearch</code>)과 문서 URL에는 기존 이름이 남아 있어 이 문서에서는 익숙한 이름을 그대로 씁니다.
+    </div>
+  </header>
+
+  <section>
+    <h2>한눈에 보기</h2>
+    <div class="cards">
+      <div class="card web">
+        <span class="tag">공개 웹</span>
+        <h3>Grounding with Google Search</h3>
+        <p class="oneliner">Gemini가 Google 검색을 직접 돌려서 최신 웹 정보로 답변</p>
+        <ul>
+          <li>사전 준비 없음 — 도구 하나만 켜면 끝</li>
+          <li>검색어 생성 · 검색 · 답변 합성을 Google 서버가 한 번에 처리</li>
+          <li>뉴스, 날씨, 시세처럼 "지금"이 중요한 질문에 적합</li>
+        </ul>
+      </div>
+      <div class="card data">
+        <span class="tag">내 데이터</span>
+        <h3>Vertex AI Search <span style="color:var(--muted);font-weight:400">(Agent Search)</span></h3>
+        <p class="oneliner">내 문서·웹사이트를 색인한 검색 엔진을 만들고, 그걸 근거로 답변</p>
+        <ul>
+          <li>데이터 스토어 생성 · 색인이 먼저 필요</li>
+          <li>독립 검색 제품(검색 API · 답변 API)이면서 Gemini의 근거 소스로도 연결 가능</li>
+          <li>사내 문서, 제품 매뉴얼, 고객센터 FAQ 같은 RAG에 적합</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>동작 흐름</h2>
+    <div class="flow">
+      <div class="flow-title" style="color:var(--web)">Grounding with Google Search</div>
+      <div class="steps">
+        <span class="step">사용자 질문</span><span class="arrow">→</span>
+        <span class="step">Gemini가 검색 필요 여부 판단</span><span class="arrow">→</span>
+        <span class="step hl-web">Google 검색 쿼리 생성 · 실행</span><span class="arrow">→</span>
+        <span class="step">검색 결과로 답변 합성</span><span class="arrow">→</span>
+        <span class="step">답변 + 출처 메타데이터</span>
+      </div>
+    </div>
+    <div class="flow">
+      <div class="flow-title" style="color:var(--data)">Vertex AI Search로 Grounding</div>
+      <div class="steps">
+        <span class="step hl-data">① 데이터 스토어 생성 · 문서 색인 (사전 작업)</span><span class="arrow">→</span>
+        <span class="step">사용자 질문</span><span class="arrow">→</span>
+        <span class="step hl-data">내 데이터 스토어에서 검색</span><span class="arrow">→</span>
+        <span class="step">검색 결과로 답변 합성</span><span class="arrow">→</span>
+        <span class="step">답변 + 출처 메타데이터</span>
+      </div>
+    </div>
+    <p style="color:var(--muted);font-size:0.92rem">두 방식 모두 검색이 모델 호출 <em>안에서</em> 끝나는 "서버 측 도구"입니다. LangChain <code>@tool</code>처럼 내 코드가 검색을 실행하지 않습니다.</p>
+  </section>
+
+  <section>
+    <h2>상세 비교</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th class="web">Grounding with Google Search</th>
+            <th class="data">Vertex AI Search (Agent Search)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th>근거 데이터</th>
+            <td>Google 검색 색인 (공개 웹 전체)</td>
+            <td>내가 등록한 데이터 — 웹사이트(URL 패턴 지정), Cloud Storage 문서(PDF · HTML · TXT 등), 구조화 데이터</td>
+          </tr>
+          <tr>
+            <th>제품 성격</th>
+            <td>Gemini 모델의 기능 (도구 옵션)</td>
+            <td>독립 검색 엔진 제품. 단독 검색 API로도 쓰고, Gemini 근거 소스로도 연결</td>
+          </tr>
+          <tr>
+            <th>사전 준비</th>
+            <td>없음</td>
+            <td>데이터 스토어 생성 → 데이터 가져오기(동기화 주기 설정) → 색인 완료 대기. 파싱 · 청킹 옵션 조정 가능</td>
+          </tr>
+          <tr>
+            <th>요청 설정</th>
+            <td><code>tools: [{ googleSearch: {} }]</code><br>도메인 제외, 사용자 위치(<code>latLng</code>) 지정 가능</td>
+            <td><code>tools: [{ retrieval: { vertexAiSearch: { datastore } } }]</code><br>데이터 스토어 최대 10개</td>
+          </tr>
+          <tr>
+            <th>최신성</th>
+            <td>Google 검색 색인 수준의 실시간성</td>
+            <td>마지막 동기화 시점까지 (동기화 주기에 의존)</td>
+          </tr>
+          <tr>
+            <th>응답 메타데이터</th>
+            <td><code>webSearchQueries</code>, <code>searchEntryPoint</code>(검색 추천 HTML), <code>groundingChunks</code>(출처 URL · 제목), <code>groundingSupports</code>(문장 ↔ 출처 매핑)</td>
+            <td><code>groundingChunks</code>(내 문서 출처), <code>groundingSupports</code>, <code>retrievalMetadata</code></td>
+          </tr>
+          <tr>
+            <th>요금 구조</th>
+            <td>
+              <ul>
+                <li>Gemini 토큰 요금</li>
+                <li><strong>+ 검색 쿼리당 요금</strong> — Gemini 3.x: 월 5,000건 무료(3.x 모델 공유), 이후 <strong>$14 / 1,000 쿼리</strong></li>
+                <li>Gemini 3부터 프롬프트가 아닌 <em>생성된 검색 쿼리 수</em>로 과금 (한 질문에 쿼리 여러 개 가능)</li>
+                <li>검색 결과로 들어가는 입력 토큰은 과금 안 함</li>
+              </ul>
+            </td>
+            <td>
+              <ul>
+                <li>Gemini 토큰 요금</li>
+                <li><strong>+ 근거 생성 요금</strong> $2.50 / 1,000 요청 (내 데이터 기반 grounded generation)</li>
+                <li><strong>+ 검색 엔진 요금</strong> — Standard $1.50 / Enterprise $4.00 (1,000 쿼리당), 월 10,000 쿼리 무료</li>
+                <li><strong>+ 색인 저장</strong> $5.00 / GiB · 월 (10 GiB 무료)</li>
+                <li>고정 용량 구독형(configurable pricing)도 선택 가능</li>
+              </ul>
+            </td>
+          </tr>
+          <tr>
+            <th>제한</th>
+            <td>하루 100만 쿼리 (초과 시 지원팀 문의)</td>
+            <td>요청당 데이터 스토어 최대 10개</td>
+          </tr>
+          <tr>
+            <th>표시 의무</th>
+            <td><strong>있음</strong> — <code>searchEntryPoint</code>의 검색 추천을 원본 그대로, 답변과 같은 폭으로, 답변이 보이는 동안 항상 표시. 클릭 시 검색 결과로 바로 이동</td>
+            <td>없음 (내 데이터이므로 표시 방식 자유)</td>
+          </tr>
+          <tr>
+            <th>도구 조합</th>
+            <td colspan="2">두 검색 도구는 <strong>한 요청에서 함께</strong> 쓸 수 있음 (웹 + 사내 문서 동시 근거). 단, 검색 도구는 <strong>일반 함수 호출 도구와는 한 요청에 섞을 수 없음</strong>.</td>
+          </tr>
+          <tr>
+            <th>대표 사례</th>
+            <td>최신 뉴스 요약, 날씨 · 시세, 일반 사실 확인, 범용 어시스턴트</td>
+            <td>사내 지식 검색, 제품 매뉴얼 Q&amp;A, 고객 지원 챗봇, 정책 · 규정 안내</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>코드로 보면</h2>
+    <div class="code-grid">
+      <div class="code-block web">
+        <div class="label">Grounding with Google Search · LangChain (web_chat.py 현재 코드)</div>
+<pre><code>llm = ChatGoogleGenerativeAI(
+    model="gemini-3.8-flash",
+    vertexai=True,
+    project=project_id,
+    location="global",
+)
+<span class="cm"># 내장 검색 도구 연결 — 이게 전부</span>
+llm = llm.bind_tools([{"google_search": {}}])</code></pre>
+      </div>
+      <div class="code-block data">
+        <div class="label">Vertex AI Search로 Grounding · google-genai SDK (공식 문서 예제)</div>
+<pre><code>DATASTORE = (
+    "projects/PROJECT_ID/locations/global/"
+    "collections/default_collection/"
+    "dataStores/DATASTORE_ID"
+)
+tool = Tool(retrieval=Retrieval(
+    vertex_ai_search=VertexAISearch(datastore=DATASTORE)
+))
+client.models.generate_content(
+    model="gemini-3.8-flash",
+    contents=question,
+    config=GenerateContentConfig(tools=[tool]),
+)</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>무엇을 고를까</h2>
+    <div class="guide">
+      <div class="guide-row"><span>"오늘", "최신", "지금" 같은 실시간 공개 정보가 필요하다</span><span class="pick web">Google Search</span></div>
+      <div class="guide-row"><span>답이 사내 문서 · 내 웹사이트 · 제품 매뉴얼 안에 있다</span><span class="pick data">Vertex AI Search</span></div>
+      <div class="guide-row"><span>공개 웹에 없는 비공개 데이터를 다뤄야 한다</span><span class="pick data">Vertex AI Search</span></div>
+      <div class="guide-row"><span>준비 작업 없이 오늘 바로 붙여야 한다</span><span class="pick web">Google Search</span></div>
+      <div class="guide-row"><span>답변 출처를 우리 도메인 문서로만 한정해 환각 위험을 줄이고 싶다</span><span class="pick data">Vertex AI Search</span></div>
+      <div class="guide-row"><span>사내 규정 + 최신 외부 동향을 같이 근거로 삼아야 한다</span><span class="pick both">둘 다 (한 요청에 조합)</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>이 프로젝트(web_chat.py)에 대입하면</h2>
+    <ul>
+      <li><strong>현재:</strong> 검색 방식 "Vertex AI Grounding"이 <em>Grounding with Google Search</em>입니다. 모델이 <code>gemini-3.8-flash</code>이므로 월 5,000 쿼리 이후 $14 / 1,000 쿼리가 붙는데, 화면의 예상 비용은 토큰 요금만 계산하고 있습니다.</li>
+      <li><strong>표시 의무 미충족:</strong> <code>searchEntryPoint</code> 검색 추천을 아직 렌더링하지 않습니다. 개인 실습을 넘어 공개한다면 먼저 추가해야 합니다.</li>
+      <li><strong>Vertex AI Search를 추가하려면:</strong> 데이터 스토어를 만든 뒤 검색 방식 옵션에 <code>retrieval.vertexAiSearch</code> 도구를 하나 더 붙이면 됩니다. 이 경우에도 CSE 같은 LangChain 함수 도구와는 같은 요청에 섞을 수 없다는 점에 주의하세요.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>출처</h2>
+    <ol class="sources">
+      <li><a href="https://docs.cloud.google.com/vertex-ai/generative-ai/docs/grounding/grounding-with-google-search">Grounding with Google Search — Google Cloud 문서</a></li>
+      <li><a href="https://docs.cloud.google.com/vertex-ai/generative-ai/docs/grounding/grounding-with-vertex-ai-search">Grounding with Agent Search (Vertex AI Search) — Google Cloud 문서</a></li>
+      <li><a href="https://cloud.google.com/vertex-ai/generative-ai/pricing">Agent Platform (Vertex AI) 생성형 AI 가격</a></li>
+      <li><a href="https://cloud.google.com/generative-ai-app-builder/pricing">Agent Search (Vertex AI Search) 가격</a></li>
+      <li><a href="https://docs.cloud.google.com/generative-ai-app-builder/docs/getting-support">Vertex AI Search → Agent Search 명칭 변경 안내</a></li>
+      <li><a href="https://docs.cloud.google.com/gemini-enterprise-agent-platform/release-notes">Gemini Enterprise Agent Platform 릴리스 노트 (2026-04 리브랜딩)</a></li>
+    </ol>
+  </section>
+
+</main>
+</body>
+</html>
