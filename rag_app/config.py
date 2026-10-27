@@ -8,9 +8,19 @@ GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
 LLM_LOCATION = os.getenv("RAG_LLM_LOCATION", os.getenv("GOOGLE_CLOUD_LOCATION", "global"))
 EMBEDDING_LOCATION = os.getenv("RAG_EMBEDDING_LOCATION", "global")
 
-# Gemini 모델
+# Gemini 모델 (LLM_MODEL은 Gemini 답변과 PDF 속 이미지 읽기에 함께 사용)
 EMBEDDING_MODEL = os.getenv("RAG_EMBEDDING_MODEL", "gemini-embedding-2")
 LLM_MODEL = os.getenv("RAG_LLM_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.8-flash"))
+
+# 답변 모델 선택지: {내부 키: 화면 표시 이름} (chat_app/config.py의 MODEL_OPTIONS와 같은 이름)
+LLM_GEMINI = "Google Gemini (Vertex AI)"
+LLM_OLLAMA_GEMMA = "Ollama Gemma (gemma4:e2b)"
+LLM_OPTIONS = {
+    LLM_GEMINI: "Gemini Flash",
+    LLM_OLLAMA_GEMMA: "Gemma 4 (로컬)",
+}
+LLM_CAPTIONS = ["Vertex AI · 빠른 응답", "Ollama · 로컬 실행, 무료"]
+OLLAMA_MODEL = "gemma4:e2b"
 
 # 벡터 스토어: docker-compose.yml의 PostgreSQL(pgvector) — chat_app과 같은 DB를 쓰고 테이블만 분리
 # (langchain-postgres가 langchain_pg_collection / langchain_pg_embedding 테이블을 만들어 관리)
@@ -24,6 +34,7 @@ COLLECTION_NAME = os.getenv("RAG_COLLECTION_NAME", "rag_pdf")
 
 # PDF 속 이미지 처리 (스캔 PDF는 페이지 전체가 이미지라 이 옵션 없이는 텍스트가 0자)
 # gemini: 이미지마다 Gemini가 글자를 받아 적고 도표 · 그림을 설명한 텍스트를 페이지 본문에 끼워 넣음
+# (IMAGE_PROMPT는 기본값이며 화면 사이드바에서 수정 가능)
 IMAGE_OFF = "off"
 IMAGE_GEMINI = "gemini"
 IMAGE_OPTIONS = {

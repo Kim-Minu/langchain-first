@@ -18,6 +18,9 @@
 - [x] `rag_app/app.py` — B 탭: 질문, 단계별 출력, LCEL 체인 비교
 - [x] 오류 안내 (ADC 재인증 · DB 미실행 · pgvector 없음)
 - [x] PDF 속 이미지 처리: `GeminiImageReader` + pypdf `page.images`, 사이드바 on/off, 병렬 요청 · 재시도
+- [x] 같은 문서 건너뛰기: `file_sha256` · `make_index_key` · `find_same_index`, 컬렉션 metadata 기록, '같은 문서여도 다시 인덱싱' 체크박스, B 탭에 파일명 표시
+- [x] 이미지 읽기 프롬프트 사이드바 입력 (비우면 기본값, 바꾸면 재인덱싱 경고), 빈 응답 재시도 · 경고
+- [x] 답변 모델 선택: Gemini Flash / Ollama Gemma 4 (로컬), Ollama 오류 안내
 - [x] A-1 경고: 글자 없는 페이지, 변환 실패 · 단색 이미지
 
 ## 검증
@@ -30,10 +33,12 @@
 - [x] `gemini-embedding-2` 배치 미지원 대응 (청크별 요청 + 동시 요청), `us-central1` 미제공 → 임베딩 리전 `global`
 
 - [x] 스캔 PDF 실제 Gemini 변환: JPEG(DCT) · 흑백 1비트(CCITTFax) 정상, 텍스트 전용 PDF는 호출 없음, 40px 아이콘 건너뜀, 팔레트 형식이 단색으로 풀리는 경우 경고 표시
+- [x] Ollama `gemma4:e2b` 답변: Gemini 임베딩 검색 결과로 근거 번호 포함 답변 · LCEL 체인 동일, 화면에서 선택 시 오류 없음
+- [x] 같은 문서 판단 7가지 경우 (실제 pgvector): 같은 문서 · 이름만 바뀐 파일 → 건너뜀 / 청크 설정 변경 · 내용 변경 · 이미지 실패 이력 · 청크 누락 · 키 없는 기존 컬렉션 → 재인덱싱
 
 ## 다음 후보 (범위 밖)
 
-- [ ] 여러 PDF를 한 컬렉션에 누적 저장 (현재는 재인덱싱 시 교체)
+- [ ] 여러 PDF를 한 컬렉션에 누적 저장 (현재는 재인덱싱 시 교체) — 청크 metadata의 `file_sha256`으로 문서별 교체 · 삭제 가능
 - [ ] MMR 검색(`max_marginal_relevance_search`)으로 중복 청크 줄이기 옵션
 - [ ] 답변 스트리밍
 - [ ] 페이지 전체를 이미지로 렌더링하는 폴백 (pypdfium2) — 이미지 형식 해석 실패 · 벡터 도형으로 그린 차트까지 처리

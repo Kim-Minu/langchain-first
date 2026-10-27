@@ -41,8 +41,15 @@ with st.sidebar:
     image_mode = st.radio(
         "PDF 속 이미지", list(config.IMAGE_OPTIONS), format_func=config.IMAGE_OPTIONS.get,
         index=list(config.IMAGE_OPTIONS).index(config.IMAGE_MODE),
-        help="스캔 PDF는 페이지 전체가 이미지라 끄면 텍스트가 0자. 켜면 이미지마다 답변 모델(Gemini)을 한 번씩 호출",
+        help="스캔 PDF는 페이지 전체가 이미지라 끄면 텍스트가 0자. 켜면 이미지마다 Gemini(아래 B의 Gemini 모델 ID)를 한 번씩 호출",
     )
+    image_prompt = None
+    if image_mode == config.IMAGE_GEMINI:
+        # 비우면 기본 프롬프트 사용 (빈 지시로 호출하면 결과가 들쭉날쭉해짐)
+        image_prompt = st.text_area(
+            "이미지 읽기 프롬프트", config.IMAGE_PROMPT, height=200,
+            help="이미지마다 Gemini에 이 지시와 함께 보냄. 바꾸면 다시 인덱싱해야 반영됨",
+        ).strip() or config.IMAGE_PROMPT
     chunk_size = st.number_input(
         "청크 크기 (글자)", config.CHUNK_SIZE_MIN, config.CHUNK_SIZE_MAX, config.CHUNK_SIZE, step=100,
         help="청크 하나의 최대 글자 수. 작을수록 검색이 정밀하지만 문맥이 끊기기 쉬움",
@@ -61,7 +68,13 @@ with st.sidebar:
 
     st.subheader("B. 질문 · 답변")
     top_k = st.slider("검색할 청크 수 (top-k)", config.TOP_K_MIN, config.TOP_K_MAX, config.TOP_K)
-    llm_model = st.text_input("답변 모델 (Gemini)", config.LLM_MODEL)
+    llm_choice = st.radio(
+        "답변 모델", list(config.LLM_OPTIONS), format_func=config.LLM_OPTIONS.get, captions=config.LLM_CAPTIONS,
+    )
+    llm_model = st.text_input(
+        "Gemini 모델 ID", config.LLM_MODEL,
+        help="Gemini 답변과 PDF 속 이미지 읽기에 사용 (Gemma를 골라도 이미지 읽기는 Gemini)",
+    )
     max_output_tokens = st.number_input("출력 토큰 상한", 256, 65536, config.MAX_OUTPUT_TOKENS, step=256)
     instructions = st.text_area("지시문 (시스템 프롬프트)", config.SYSTEM_PROMPT, height=200)
 
@@ -85,6 +98,16 @@ def get_llm(model: str, max_tokens: int):
     return rag.create_llm(model, max_tokens)
 
 
+@st.cache_resource(show_spinner=False)
+def get_answer_llm(choice: str, gemini_model: str, max_tokens: int):
+    if choice == config.LLM_OLLAMA_GEMMA:
+        return rag.create_ollama_llm(config.OLLAMA_MODEL, max_tokens)
+    return get_llm(gemini_model, max_tokens)
+
+
+answer_model = config.OLLAMA_MODEL if llm_choice == config.LLM_OLLAMA_GEMMA else llm_model
+
+
 def step_header(label: str, title: str, caption: str) -> None:
     st.markdown(f"#### {label}. {title}")
     st.caption(caption)
@@ -99,7 +122,41 @@ def show_error(step: str, error: Exception) -> None:
         hint = "\n\n`docker compose up -d`로 PostgreSQL(pgvector)을 먼저 실행하세요."
     elif 'type "vector" does not exist' in message or "extension" in message and "vector" in message:
         hint = "\n\n도커 이미지가 pgvector를 포함하는지 확인하세요 (`pgvector/pgvector:pg17`)."
+    elif "langchain_ollama" in message:
+        hint = "\n\n`uv add langchain-ollama`로 패키지를 설치하세요."
+    elif "11434" in message or "ollama" in message.lower():
+        hint = f"\n\n`ollama serve`로 Ollama를 실행하고 `ollama pull {config.OLLAMA_MODEL}`로 모델을 받아 두세요."
     st.error(f"{step} 실패: {error}{hint}")
+
+
+def run_index_steps(result: dict, data: bytes, file_name: str, index_info: dict) -> None:
+    """A-1 ~ A-4를 차례로 실행하며 단계 결과를 result에 쌓음 (중간에 실패해도 그 전 단계 결과는 화면에 남음)."""
+    use_images = image_mode == config.IMAGE_GEMINI
+    st.write("1) 문서 읽기" + (f" (이미지는 {llm_model}로 변환 — 이미지가 많으면 오래 걸림)" if use_images else ""))
+    # 실패 기록(failures)이 이전 인덱싱과 섞이지 않게 매번 새로 만듦 (LLM 객체는 캐시 재사용)
+    image_reader = (
+        rag.GeminiImageReader(get_llm(llm_model, config.IMAGE_MAX_OUTPUT_TOKENS), image_prompt)
+        if use_images else None
+    )
+    result["pages"] = rag.load_pdf(data, file_name, image_reader)
+    result["image_failures"] = image_reader.failures if image_reader else []
+    st.write("2) 청크로 나누기")
+    result["chunks"] = rag.split_documents(result["pages"], chunk_size, chunk_overlap)
+    if not result["chunks"]:
+        raise ValueError(
+            "추출된 텍스트가 없습니다. 이미지 안의 글자도 찾지 못했습니다."
+            if use_images
+            else "추출된 텍스트가 없습니다. 스캔 PDF라면 사이드바 'PDF 속 이미지'를 Gemini로 켜고 다시 인덱싱하세요."
+        )
+    st.write(f"3) 임베딩하기 ({len(result['chunks'])}개 청크)")
+    embeddings = get_embeddings(embedding_model, embedding_dim)
+    result["vectors"] = rag.embed_chunks(embeddings, result["chunks"])
+    st.write("4) 벡터 스토어 저장")
+    store = get_store(embedding_model, embedding_dim, collection_name)
+    result["ids"] = rag.save_to_store(
+        store, result["chunks"], result["vectors"],
+        {**index_info, "image_failures": len(result["image_failures"])},
+    )
 
 
 def preview(text: str, length: int = 120) -> str:
@@ -110,7 +167,7 @@ def preview(text: str, length: int = 120) -> str:
 st.title("📄 PDF RAG 실습")
 st.caption(
     "LangChain으로 구성한 RAG 파이프라인을 단계별로 실행하고 각 단계의 출력값을 확인합니다. "
-    f"임베딩 `{embedding_model}` · 답변 `{llm_model}` · 벡터 스토어 PostgreSQL(pgvector) `{collection_name}`"
+    f"임베딩 `{embedding_model}` · 답변 `{answer_model}` · 벡터 스토어 PostgreSQL(pgvector) `{collection_name}`"
 )
 
 tab_index, tab_query = st.tabs(["A. 미리 준비하기 (인덱싱)", "B. 질문에 답하기 (런타임)"])
@@ -122,16 +179,22 @@ with tab_index:
     st.info("자료를 등록하거나 변경할 때 한 번 실행합니다. 결과는 PostgreSQL에 저장되어 앱을 다시 켜도 남습니다.")
     uploaded = st.file_uploader("PDF 파일", type=["pdf"], accept_multiple_files=False)
 
-    index_settings = {
-        "file": uploaded.name if uploaded else None,
+    # 저장 결과를 바꾸는 설정 — 파일 내용 해시와 합쳐 "같은 문서" 판단 키가 됨
+    content_settings = {
         "image_mode": image_mode,
+        "image_prompt": image_prompt,
+        "image_model": llm_model if image_mode == config.IMAGE_GEMINI else None,
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
         "embedding_model": embedding_model,
         "embedding_dim": embedding_dim,
-        "collection": collection_name,
     }
+    index_settings = {"file": uploaded.name if uploaded else None, "collection": collection_name, **content_settings}
 
+    force_reindex = st.checkbox(
+        "같은 문서여도 다시 인덱싱",
+        help="파일 내용과 설정이 마지막 인덱싱과 같으면 API 호출 없이 건너뜀. 체크하면 단계별 출력을 다시 만듦",
+    )
     run_index = st.button(
         "인덱싱 실행", type="primary", disabled=uploaded is None or not chunk_settings_ok,
     )
@@ -143,29 +206,24 @@ with tab_index:
             try:
                 if not rag.pdf_name_is_valid(uploaded.name):
                     raise ValueError("PDF 파일만 업로드할 수 있습니다.")
-                use_images = image_mode == config.IMAGE_GEMINI
-                st.write("1) 문서 읽기" + (f" (이미지는 {llm_model}로 변환 — 이미지가 많으면 오래 걸림)" if use_images else ""))
-                # 실패 기록(failures)이 이전 인덱싱과 섞이지 않게 매번 새로 만듦 (LLM 객체는 캐시 재사용)
-                image_reader = (
-                    rag.GeminiImageReader(get_llm(llm_model, config.IMAGE_MAX_OUTPUT_TOKENS)) if use_images else None
-                )
-                result["pages"] = rag.load_pdf(uploaded.getvalue(), uploaded.name, image_reader)
-                result["image_failures"] = image_reader.failures if image_reader else []
-                st.write("2) 청크로 나누기")
-                result["chunks"] = rag.split_documents(result["pages"], chunk_size, chunk_overlap)
-                if not result["chunks"]:
-                    raise ValueError(
-                        "추출된 텍스트가 없습니다. 이미지 안의 글자도 찾지 못했습니다."
-                        if use_images
-                        else "추출된 텍스트가 없습니다. 스캔 PDF라면 사이드바 'PDF 속 이미지'를 Gemini로 켜고 다시 인덱싱하세요."
+                data = uploaded.getvalue()
+                file_hash = rag.file_sha256(data)
+                index_key = rag.make_index_key(file_hash, content_settings)
+                same = None if force_reindex else rag.find_same_index(collection_name, index_key)
+                if same:
+                    result["skipped"] = same
+                    status.update(label="이미 인덱싱된 문서 — 건너뜀", state="complete", expanded=False)
+                else:
+                    run_index_steps(
+                        result, data, uploaded.name,
+                        {
+                            "index_key": index_key,
+                            "file_sha256": file_hash,
+                            "file_name": uploaded.name,
+                            "settings": content_settings,
+                        },
                     )
-                st.write(f"3) 임베딩하기 ({len(result['chunks'])}개 청크)")
-                embeddings = get_embeddings(embedding_model, embedding_dim)
-                result["vectors"] = rag.embed_chunks(embeddings, result["chunks"])
-                st.write("4) 벡터 스토어 저장")
-                store = get_store(embedding_model, embedding_dim, collection_name)
-                result["ids"] = rag.save_to_store(store, result["chunks"], result["vectors"])
-                status.update(label="인덱싱 완료", state="complete", expanded=False)
+                    status.update(label="인덱싱 완료", state="complete", expanded=False)
             except Exception as e:
                 status.update(label="인덱싱 실패", state="error")
                 show_error("인덱싱", e)
@@ -175,6 +233,13 @@ with tab_index:
     if result:
         if result["settings"] != index_settings:
             st.warning("사이드바 설정이나 파일이 마지막 인덱싱 때와 다릅니다. 반영하려면 다시 인덱싱하세요.")
+        if "skipped" in result:
+            info = result["skipped"]
+            st.success(
+                f"같은 내용(sha256 `{info['file_sha256'][:12]}…`) · 같은 설정으로 {info['indexed_at']}에 "
+                f"인덱싱된 문서라 건너뛰었습니다. 임베딩 · 이미지 읽기 API를 호출하지 않았습니다.\n\n"
+                "단계별 출력을 다시 보려면 '같은 문서여도 다시 인덱싱'을 체크하고 실행하세요."
+            )
 
         # 1) 문서 읽기
         if "pages" in result:
@@ -269,7 +334,7 @@ with tab_index:
             )
 
         # 4) 벡터 스토어 저장
-        if "ids" in result:
+        if "ids" in result or "skipped" in result:
             st.divider()
             step_header(
                 "A-4", "벡터 스토어 저장",
@@ -285,6 +350,8 @@ with tab_index:
                     ),
                     hide_index=True, width="stretch",
                 )
+                with st.expander("컬렉션 metadata (같은 문서 판단에 쓰는 인덱싱 정보)"):
+                    st.json(rag.get_collection_info(result["settings"]["collection"]))
             except Exception as e:
                 show_error("저장 결과 조회", e)
 
@@ -295,14 +362,16 @@ with tab_query:
     st.info("질문이 들어올 때마다 실행합니다. A에서 저장한 컬렉션에서 관련 청크를 찾아 답변의 근거로 씁니다.")
 
     try:
-        stored_total, _ = rag.inspect_collection(collection_name, limit=0)
+        collection_info = rag.get_collection_info(collection_name) or {}
     except Exception as e:
-        stored_total = 0
+        collection_info = {}
         show_error("컬렉션 조회", e)
+    stored_total = collection_info.get("stored_chunks", 0)
     if stored_total == 0:
         st.warning(f"컬렉션 `{collection_name}`에 저장된 청크가 없습니다. A 탭에서 먼저 인덱싱하세요.")
     else:
-        st.caption(f"컬렉션 `{collection_name}` · 청크 {stored_total}개")
+        file_label = f" · {collection_info['file_name']}" if collection_info.get("file_name") else ""
+        st.caption(f"컬렉션 `{collection_name}`{file_label} · 청크 {stored_total}개")
 
     with st.form("question_form"):
         question = st.text_area("질문", placeholder="문서 내용에 대해 질문하세요", height=80)
@@ -313,7 +382,7 @@ with tab_query:
         asked = st.form_submit_button("질문하기", type="primary", disabled=stored_total == 0)
 
     if asked and question.strip():
-        qa: dict = {"question": question.strip(), "k": top_k}
+        qa: dict = {"question": question.strip(), "k": top_k, "answer_model": answer_model}
         st.session_state.pop("qa_result", None)
         with st.status("답변 생성 중…", expanded=True) as status:
             try:
@@ -326,7 +395,7 @@ with tab_query:
                 st.write("3) 프롬프트 구성")
                 qa["messages"] = rag.build_prompt(instructions, [doc for doc, _ in qa["hits"]], qa["question"])
                 st.write("4) LLM 답변")
-                llm = get_llm(llm_model, max_output_tokens)
+                llm = get_answer_llm(llm_choice, llm_model, max_output_tokens)
                 qa["answer"] = rag.generate_answer(llm, qa["messages"])
                 if run_chain_too:
                     st.write("+) LCEL 체인 실행")
@@ -380,7 +449,7 @@ with tab_query:
         if "answer" in qa:
             st.divider()
             answer = qa["answer"]
-            step_header("B-4", "LLM → 답변", f"근거를 읽고 생성 · {llm_model}")
+            step_header("B-4", "LLM → 답변", f"근거를 읽고 생성 · {qa['answer_model']}")
             st.markdown(answer.text)
             usage = answer.usage_metadata or {}
             c1, c2, c3 = st.columns(3)

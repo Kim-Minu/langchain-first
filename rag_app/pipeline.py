@@ -16,10 +16,13 @@ build_rag_chain은 B의 1~4를 LCEL 체인 하나로 연결한 것 (찾는 일�
 """
 
 import base64
+import hashlib
 import io
+import json
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import google.auth
@@ -35,6 +38,7 @@ from langchain_core.runnables import Runnable, RunnableLambda, RunnablePassthrou
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_postgres import PGVector
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from psycopg.types.json import Jsonb
 
 from rag_app.config import (
     DATABASE_URL,
@@ -102,10 +106,16 @@ class GeminiImageReader:
         for attempt in range(1, self.attempts + 1):
             try:
                 text = self.model.invoke([message]).text.strip()
-                return f"{IMAGE_TEXT_MARK}\n{text}" if text else ""
             except Exception as e:  # 일시적인 504 · 429 등
                 if attempt == self.attempts:
                     self.failures.append(f"{label} · {type(e).__name__}: {str(e)[:200]}")
+                continue
+            if text:
+                return f"{IMAGE_TEXT_MARK}\n{text}"
+            # 작은 이미지 · 단색 이미지는 미리 걸렀으므로 빈 응답은 일시적인 현상일 수 있어 재시도,
+            # 그래도 비면 조용히 사라지지 않게 기록
+            if attempt == self.attempts:
+                self.failures.append(f"{label} · Gemini 빈 응답 (내용 없음으로 판단했거나 일시적 오류)")
         return ""
 
 
@@ -172,12 +182,14 @@ def load_pdf(data: bytes, file_name: str, image_reader: GeminiImageReader | None
         pages = PyPDFLoader(tmp.name).load()
 
     image_texts = _read_page_images(data, image_reader) if image_reader else []
+    file_hash = file_sha256(data)
     for i, doc in enumerate(pages):
         if i < len(image_texts) and image_texts[i]:
             doc.page_content = f"{doc.page_content.rstrip()}\n\n{image_texts[i]}".lstrip()
         # source가 임시 파일 경로로 들어가므로 원래 파일명으로 교체, 페이지는 사람이 읽는 1부터
         doc.metadata = {
             "source": file_name,
+            "file_sha256": file_hash,  # 같은 내용의 파일인지 판단 (청크까지 그대로 전달됨)
             "page": doc.metadata.get("page", 0) + 1,
             "total_pages": doc.metadata.get("total_pages", len(pages)),
         }
@@ -230,18 +242,75 @@ def get_vector_store(embeddings: GoogleGenerativeAIEmbeddings, collection_name: 
     )
 
 
-def save_to_store(store: PGVector, chunks: list[Document], vectors: list[list[float]]) -> list[str]:
+def file_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def make_index_key(file_hash: str, content_settings: dict) -> str:
+    """같은 문서 판단 기준: 파일 내용 해시 + 저장 결과를 바꾸는 설정(청크 · 임베딩 · 이미지 읽기).
+
+    파일명은 넣지 않음 — 이름만 바뀐 같은 파일은 같은 문서, 이름이 같아도 내용이 바뀌면 다른 문서.
+    """
+    payload = json.dumps({"file_sha256": file_hash, **content_settings}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def get_collection_info(collection_name: str) -> dict | None:
+    """컬렉션 metadata(마지막 인덱싱 정보)와 실제 저장된 청크 수. 컬렉션이 없으면 None."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        row = conn.execute(
+            """
+            SELECT c.cmetadata,
+                   (SELECT count(*) FROM langchain_pg_embedding e WHERE e.collection_id = c.uuid)
+            FROM langchain_pg_collection c
+            WHERE c.name = %s
+            """,  # cmetadata는 json 타입이라 GROUP BY에 쓸 수 없어 청크 수는 서브쿼리로
+            (collection_name,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {**(row[0] or {}), "stored_chunks": row[1]}
+
+
+def find_same_index(collection_name: str, index_key: str) -> dict | None:
+    """같은 내용 · 같은 설정으로 이미 온전히 인덱싱돼 있으면 그 정보를, 아니면 None.
+
+    이미지 변환 실패가 있었거나 저장된 청크 수가 기록과 다르면(저장 도중 실패) 다시 인덱싱해야 하므로 None.
+    """
+    info = get_collection_info(collection_name)
+    if (
+        info is None
+        or info.get("index_key") != index_key
+        or info.get("image_failures", 0) > 0
+        or info.get("chunks") != info["stored_chunks"]
+    ):
+        return None
+    return info
+
+
+def save_to_store(
+    store: PGVector, chunks: list[Document], vectors: list[list[float]], index_info: dict,
+) -> list[str]:
     """4) 벡터 스토어 저장: 컬렉션을 비우고 벡터 + 원문 + 출처(metadata)를 한 행으로 저장.
 
-    add_documents는 내부에서 다시 임베딩하므로, 3단계에서 만든 벡터를 그대로 쓰는 add_embeddings 사용.
+    - add_documents는 내부에서 다시 임베딩하므로, 3단계에서 만든 벡터를 그대로 쓰는 add_embeddings 사용
+    - index_info(인덱싱 키 · 파일 해시 · 청크 수 등)는 청크 저장이 끝난 뒤 컬렉션 metadata에 기록
+      → 저장 도중 실패하면 키가 남지 않아 다음 인덱싱에서 잘못 건너뛰지 않음
     """
     store.delete_collection()
     store.create_collection()
-    return store.add_embeddings(
+    ids = store.add_embeddings(
         texts=[chunk.page_content for chunk in chunks],
         embeddings=vectors,
         metadatas=[chunk.metadata for chunk in chunks],
     )
+    info = {**index_info, "chunks": len(chunks), "indexed_at": datetime.now().isoformat(timespec="seconds")}
+    with psycopg.connect(DATABASE_URL) as conn:
+        conn.execute(
+            "UPDATE langchain_pg_collection SET cmetadata = %s WHERE name = %s",
+            (Jsonb(info), store.collection_name),
+        )
+    return ids
 
 
 @dataclass
@@ -322,12 +391,19 @@ def create_llm(model: str, max_output_tokens: int = MAX_OUTPUT_TOKENS) -> ChatGo
     )
 
 
-def generate_answer(llm: ChatGoogleGenerativeAI, messages: list[BaseMessage]):
+def create_ollama_llm(model: str, max_output_tokens: int = MAX_OUTPUT_TOKENS) -> BaseChatModel:
+    """로컬 Ollama 모델 (chat_app과 같은 설정). Gemma 선택 시에만 필요하므로 지연 import."""
+    from langchain_ollama import ChatOllama
+
+    return ChatOllama(model=model, temperature=0, num_predict=max_output_tokens)
+
+
+def generate_answer(llm: BaseChatModel, messages: list[BaseMessage]):
     """4) LLM → 답변: 구성된 프롬프트를 그대로 보내 AIMessage(본문 + 토큰 사용량)를 받음."""
     return llm.invoke(messages)
 
 
-def build_rag_chain(store: PGVector, llm: ChatGoogleGenerativeAI, instructions: str, k: int) -> Runnable:
+def build_rag_chain(store: PGVector, llm: BaseChatModel, instructions: str, k: int) -> Runnable:
     """B의 1~4를 하나로 연결한 LCEL 체인. 입력: 질문 문자열 → 출력: 답변 문자열.
 
     - context: 질문 → retriever(질문 임베딩 + 벡터 검색) → 청크 문자열
