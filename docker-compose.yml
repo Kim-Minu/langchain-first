@@ -1,8 +1,8 @@
-# web_chat.py 대화 내역 저장용 로컬 PostgreSQL
+# web_chat.py 대화 내역 + rag_app 벡터 스토어(pgvector) 저장용 로컬 PostgreSQL
 # 실행: docker compose up -d   /   중지: docker compose down (데이터는 pgdata 볼륨에 유지)
 services:
   postgres:
-    image: postgres:17
+    image: pgvector/pgvector:pg17-trixie  # postgres:17 + pgvector (postgres:17과 같은 Debian trixie 기반 → 기존 pgdata 볼륨 collation 호환)
     environment:
       POSTGRES_USER: langchain
       POSTGRES_PASSWORD: langchain  # 로컬 개발 전용 계정

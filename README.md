@@ -48,6 +48,18 @@ uv run streamlit run web_chat.py
 - 사이드바 대화 목록 · 화면 메시지 · 토큰/비용: `chat_threads`, `chat_messages` 테이블
 - 현재 대화는 URL `?t=<thread_id>`에 남아 새로고침이나 앱 재시작 후에도 이어집니다.
 
+### PDF RAG 실습 (rag_app/) 실행
+
+PDF를 인덱싱(문서 읽기 → 청크 → 임베딩 → pgvector 저장)하고 질문에 답하는(질문 임베딩 → 검색 → 프롬프트 → Gemini 답변) 과정을 단계별 출력과 함께 보여 줍니다. 임베딩 · 답변은 Gemini(Vertex AI), 벡터 스토어는 위 도커 PostgreSQL(pgvector)을 사용합니다.
+
+```bash
+docker compose up -d
+gcloud auth application-default login   # Vertex AI 인증이 만료된 경우
+uv run streamlit run rag_app/app.py
+```
+
+청크 크기 · 겹침 · top-k · 지시문 등은 사이드바에서 바꿀 수 있습니다. 기획 · 설계 문서: [docs/rag-pdf-pipeline/](docs/rag-pdf-pipeline/01-plan.md)
+
 Vertex AI 예제는 GCP 프로젝트 ID가 코드에 `project="iceu-songpa05"`로 지정되어 있으니, 본인 프로젝트로 바꿔서 사용하세요.
 
 ## 예제
