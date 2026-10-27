@@ -66,7 +66,11 @@ flowchart TB
 | --- | --- |
 | [`rag_app/config.py`](../../rag_app/config.py) | 모든 기본값과 사이드바 입력 범위, 환경변수 읽기 |
 | [`rag_app/pipeline.py`](../../rag_app/pipeline.py) | 그림의 8단계를 함수 하나씩으로 구현. 화면 코드와 분리해 단독 테스트 가능 |
-| [`rag_app/app.py`](../../rag_app/app.py) | 사이드바 설정, 단계 실행, 결과를 `st.session_state`에 보관하고 단계별로 렌더링 |
+| [`rag_app/app.py`](../../rag_app/app.py) | PDF RAG 실습 화면. 단계 실행, 결과를 `st.session_state`에 보관하고 단계별로 렌더링 |
+| [`rag_app/ui_common.py`](../../rag_app/ui_common.py) | 두 화면이 공유하는 사이드바 설정(화면을 옮겨도 유지) · 캐시된 모델/스토어 · 오류 안내 |
+| [`rag_app/evaluation.py`](../../rag_app/evaluation.py) | OCR(파일 캐시) · 질문/정답 생성 · Gemini 채점 · 병렬 평가(할당량 재시도) · 지표 집계 |
+| [`rag_app/pages/ocr_eval.py`](../../rag_app/pages/ocr_eval.py) | OCR · RAG 평가 화면 (OCR · 인덱싱 / 질문 · 정답 / RAG 평가 / 실행 비교) |
+| [`rag_app/eval/han_gang_qa.json`](../../rag_app/eval/han_gang_qa.json) | 평가 세트 20쌍. 원본 PDF · OCR 캐시는 저작물이라 git 제외 폴더 `rag_app/eval/data/`에 둠 |
 
 ## 3. 단계별 입출력
 
@@ -166,6 +170,10 @@ erDiagram
 | 이미지 하나의 실패로 인덱싱을 멈추지 않음 | 실제로 일시적인 504가 발생해 PDF 전체가 실패한 적이 있음. 1회 재시도 후에도 실패하면 그 이미지만 건너뛰고 화면에 경고. 빈 응답도 일시적으로 발생한 적이 있어 같은 방식으로 재시도 · 경고 |
 | 단색 이미지는 Gemini에 보내지 않고 경고 | 특수 형식이 잘못 디코딩되면 까만 이미지가 나와 Gemini가 빈 응답을 주고, 오류 없이 내용만 사라진다. 이를 화면에 드러내기 위함 |
 | 답변 모델은 Gemini / Ollama Gemma 선택, 이미지 읽기는 항상 Gemini | Gemma(`gemma4:e2b`)는 로컬 · 무료로 답변 비교용. e2b는 작은 모델이라 스캔 한글 받아 적기 정확도를 기대하기 어렵고, 답변 모델 선택에 따라 인덱싱 결과가 달라지지 않도록 이미지 읽기는 Gemini로 고정 |
+| OCR은 기존 `GeminiImageReader`를 OCR 프롬프트로 재사용, 결과는 파일 캐시 | 스캔 페이지 = 이미지 1장이라 이미지 읽기와 같은 경로. `[이미지 설명]` 표시만 생략(`mark=None`). 20쪽 OCR에 약 3분이 걸려 파일 · 모델 · 프롬프트별로 캐시하고, 실패한 쪽이 있으면 저장하지 않음 |
+| 평가 세트에 사용자 말투 질문을 함께 둠 | LLM이 만든 질문은 문서 문장을 그대로 따라 써서 검색이 실제보다 쉬움(원문 1.00 vs 말투 0.90). 같은 정답으로 두 세트를 평가 |
+| 채점은 LLM, 검색은 정답 쪽 포함 여부 · 순위로 따로 측정 | 답변 실패가 검색 때문인지 생성 때문인지 구분하기 위함 |
+| 쪽을 넘어 이어서 청크 나누기 (옵션, 기본 꺼짐) | 쪽 경계에서 끊긴 문장(욱/리하 등)을 한 청크로. 앞 쪽이 문장 끝으로 끝나지 않으면 띄어 쓰지 않고 붙임. 효과는 미검증이라 기본값은 유지 |
 | 청크마다 따로 임베딩 요청 + 스레드 동시 요청 (`EMBEDDING_CONCURRENCY`, 기본 8) | Vertex AI의 `gemini-embedding-2`는 요청 한 번에 텍스트 하나만 받는다(배치 시 "only supports one content at a time" 오류). 순서를 유지한 채 동시에 보내 인덱싱 시간을 줄임 |
 | 문서용 · 질문용 임베딩 분리 (`embed_documents` / `embed_query`) | Gemini 임베딩은 `task_type`(RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY)에 따라 검색에 최적화된 벡터를 만든다. LangChain이 메서드별로 자동 지정 |
 | 지시문을 템플릿 문자열이 아니라 변수(`{instructions}`)로 주입 | 사용자가 고친 지시문에 `{ }`가 들어가도 템플릿 변수로 해석되지 않음 |
@@ -186,6 +194,7 @@ erDiagram
 | `RAG_EMBEDDING_LOCATION` | `global` | 임베딩 엔드포인트 리전 (`gemini-embedding-2`는 `global` 전용) |
 | `RAG_EMBEDDING_CONCURRENCY` | `8` | 임베딩 동시 요청 수 (할당량 초과 시 낮춤) |
 | `RAG_IMAGE_CONCURRENCY` | `4` | 이미지 변환 동시 요청 수 |
+| `RAG_EVAL_CONCURRENCY` | `2` | 평가 동시 실행 문항 수 (문항마다 답변 + 채점 2회 호출) |
 | `RAG_LLM_MODEL` | `GEMINI_MODEL` 또는 `gemini-3.8-flash` | 답변 모델 |
 | `RAG_LLM_LOCATION` | `GOOGLE_CLOUD_LOCATION` 또는 `global` | 답변 모델 엔드포인트 |
 | `RAG_COLLECTION_NAME` | `rag_pdf` | 기본 컬렉션 이름 |
