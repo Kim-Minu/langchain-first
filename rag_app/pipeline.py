@@ -1,0 +1,422 @@
+"""RAG 파이프라인을 단계별 함수로 나눈 모듈 (화면 코드와 분리해 단계마다 결과를 확인할 수 있게 함).
+
+A. 미리 준비하기 (인덱싱 · 자료를 등록하거나 변경할 때)
+    1) load_pdf          문서 읽기      PDF → 페이지별 Document
+    2) split_documents   청크로 나누기  작은 원문 조각
+    3) embed_chunks      임베딩하기     청크 → 숫자 배열 (RETRIEVAL_DOCUMENT)
+    4) save_to_store     벡터 스토어 저장 벡터 + 원문 + 출처를 PostgreSQL(pgvector)에 함께 저장
+
+B. 질문에 답하기 (런타임 · 질문이 들어올 때마다)
+    1) embed_question    질문 입력      질문도 임베딩 (RETRIEVAL_QUERY)
+    2) search_chunks     관련 청크 검색  벡터 비교 → 원문 반환
+    3) build_prompt      프롬프트 구성   질문 + 원문 + 지시문
+    4) generate_answer   LLM → 답변     근거를 읽고 생성
+
+build_rag_chain은 B의 1~4를 LCEL 체인 하나로 연결한 것 (찾는 일과 쓰는 일을 연결한 전체 흐름 = 체인).
+"""
+
+import base64
+import hashlib
+import io
+import json
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+import google.auth
+import psycopg
+import pypdf
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnableLambda, RunnablePassthrough
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_postgres import PGVector
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from psycopg.types.json import Jsonb
+
+from rag_app.config import (
+    DATABASE_URL,
+    EMBEDDING_CONCURRENCY,
+    EMBEDDING_LOCATION,
+    GOOGLE_CLOUD_PROJECT,
+    IMAGE_CONCURRENCY,
+    IMAGE_MIN_SIZE,
+    IMAGE_PROMPT,
+    LLM_LOCATION,
+    MAX_OUTPUT_TOKENS,
+    PGVECTOR_URL,
+)
+
+PDF_MAGIC = b"%PDF-"
+IMAGE_TEXT_MARK = "[이미지 설명]"
+
+# 지시문은 사용자가 화면에서 고치므로 템플릿에 직접 넣지 않고 변수로 받음 ({ } 문자가 있어도 깨지지 않음)
+PROMPT_TEMPLATE = ChatPromptTemplate.from_messages(
+    [
+        ("system", "{instructions}\n\n[문서]\n{context}"),
+        ("human", "{question}"),
+    ]
+)
+
+
+def _vertex_credentials():
+    credentials, default_project = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+    return credentials, GOOGLE_CLOUD_PROJECT or default_project
+
+
+# ---------------------------------------------------------------------------
+# A. 미리 준비하기 (인덱싱)
+# ---------------------------------------------------------------------------
+
+
+class GeminiImageReader:
+    """PDF 속 이미지 → Gemini가 받아 적은 글자 + 그림 설명 텍스트.
+
+    - LangChain의 LLMImageBlobParser는 응답 content가 문자열이라고 가정(assert)하는데,
+      Gemini 3 계열은 content를 블록 리스트로 돌려줄 수 있어 msg.text로 읽도록 따로 둠
+    - 결과 앞에 [이미지 설명] 표시를 붙여 청크 · 프롬프트에서 본문과 구분되게 함
+    - 이미지 하나가 실패해도 PDF 전체 인덱싱이 멈추지 않도록, 재시도 후에도 실패하면 건너뛰고 failures에 기록
+      (인덱싱마다 새로 만들어 써야 failures가 섞이지 않음)
+    """
+
+    def __init__(self, model: BaseChatModel, prompt: str = IMAGE_PROMPT, attempts: int = 2):
+        self.model = model
+        self.prompt = prompt
+        self.attempts = attempts
+        self.failures: list[str] = []
+
+    def describe(self, img, label: str) -> str:
+        buffer = io.BytesIO()
+        img.convert("RGB").save(buffer, format="PNG")  # 흑백 1비트 · CMYK 등도 PNG로 통일
+        image_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+        message = HumanMessage(
+            content=[
+                {"type": "text", "text": self.prompt},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]
+        )
+        for attempt in range(1, self.attempts + 1):
+            try:
+                text = self.model.invoke([message]).text.strip()
+            except Exception as e:  # 일시적인 504 · 429 등
+                if attempt == self.attempts:
+                    self.failures.append(f"{label} · {type(e).__name__}: {str(e)[:200]}")
+                continue
+            if text:
+                return f"{IMAGE_TEXT_MARK}\n{text}"
+            # 작은 이미지 · 단색 이미지는 미리 걸렀으므로 빈 응답은 일시적인 현상일 수 있어 재시도,
+            # 그래도 비면 조용히 사라지지 않게 기록
+            if attempt == self.attempts:
+                self.failures.append(f"{label} · Gemini 빈 응답 (내용 없음으로 판단했거나 일시적 오류)")
+        return ""
+
+
+def _extract_page_images(data: bytes, reader: GeminiImageReader) -> list[list[tuple[str, object]]]:
+    """페이지별 (라벨, PIL 이미지) 목록. 아이콘 · 로고 같은 작은 이미지는 호출 비용만 들어 건너뜀.
+
+    PyPDFLoader의 extract_images는 JPEG · 일부 무손실 형식만 꺼내고 흑백 스캔에 흔한
+    CCITTFax · JBIG2 등은 조용히 건너뛰므로, 형식 해석을 Pillow에 맡기는 pypdf의 page.images를 직접 사용.
+    """
+    pdf = pypdf.PdfReader(io.BytesIO(data))
+    pages: list[list[tuple[str, object]]] = []
+    for page_no, page in enumerate(pdf.pages, start=1):
+        found = []
+        try:
+            files = list(page.images)
+        except Exception as e:  # 이미지 목록 자체를 못 읽는 손상된 페이지
+            reader.failures.append(f"p.{page_no} · 이미지 목록 읽기 실패 · {type(e).__name__}: {e}")
+            files = []
+        for i, file in enumerate(files, start=1):
+            label = f"p.{page_no} 이미지 {i}"
+            try:
+                img = file.image
+            except Exception as e:  # 지원하지 않는 압축 형식 등
+                reader.failures.append(f"{label} · 디코딩 실패 · {type(e).__name__}: {e}")
+                continue
+            if min(img.size) < IMAGE_MIN_SIZE:
+                continue
+            # 디코딩은 됐지만 한 가지 색뿐인 이미지: 빈 이미지이거나 특수 형식이 잘못 풀린 경우라
+            # Gemini에 보내도 빈 응답만 오므로, 조용히 사라지지 않게 기록만 하고 건너뜀
+            low, high = img.convert("L").getextrema()
+            if low == high:
+                reader.failures.append(f"{label} · 단색 이미지라 건너뜀 (빈 이미지이거나 형식 해석 문제)")
+                continue
+            found.append((label, img))
+        pages.append(found)
+    return pages
+
+
+def _read_page_images(data: bytes, reader: GeminiImageReader) -> list[str]:
+    """페이지별 이미지 설명 텍스트. 모든 이미지를 IMAGE_CONCURRENCY개씩 동시에 Gemini에 요청."""
+    page_images = _extract_page_images(data, reader)
+    jobs = [(page_idx, label, img) for page_idx, images in enumerate(page_images) for label, img in images]
+    with ThreadPoolExecutor(max_workers=IMAGE_CONCURRENCY) as pool:
+        texts = list(pool.map(lambda job: reader.describe(job[2], job[1]), jobs))
+    per_page = [[] for _ in page_images]
+    for (page_idx, _, _), text in zip(jobs, texts, strict=True):
+        if text:
+            per_page[page_idx].append(text)
+    return ["\n\n".join(texts) for texts in per_page]
+
+
+def load_pdf(data: bytes, file_name: str, image_reader: GeminiImageReader | None = None) -> list[Document]:
+    """1) 문서 읽기: PDF 바이트 → 페이지마다 Document 하나 (PDF만 허용).
+
+    image_reader를 주면 페이지 속 이미지도 텍스트로 바꿔 그 페이지 본문 뒤에 붙임 (스캔 PDF 대응).
+    """
+    if not data.startswith(PDF_MAGIC):
+        raise ValueError(f"PDF 파일이 아닙니다: {file_name}")
+
+    # PyPDFLoader는 파일 경로를 받으므로 업로드 바이트를 임시 파일로 저장해서 읽음
+    with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+        tmp.write(data)
+        tmp.flush()
+        pages = PyPDFLoader(tmp.name).load()
+
+    image_texts = _read_page_images(data, image_reader) if image_reader else []
+    file_hash = file_sha256(data)
+    for i, doc in enumerate(pages):
+        if i < len(image_texts) and image_texts[i]:
+            doc.page_content = f"{doc.page_content.rstrip()}\n\n{image_texts[i]}".lstrip()
+        # source가 임시 파일 경로로 들어가므로 원래 파일명으로 교체, 페이지는 사람이 읽는 1부터
+        doc.metadata = {
+            "source": file_name,
+            "file_sha256": file_hash,  # 같은 내용의 파일인지 판단 (청크까지 그대로 전달됨)
+            "page": doc.metadata.get("page", 0) + 1,
+            "total_pages": doc.metadata.get("total_pages", len(pages)),
+        }
+    return pages
+
+
+def split_documents(pages: list[Document], chunk_size: int, chunk_overlap: int) -> list[Document]:
+    """2) 청크로 나누기: 문단 → 줄 → 문장 → 단어 순으로 끊어 chunk_size 글자 이하 조각으로."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        add_start_index=True,  # 페이지 안에서 청크가 시작하는 글자 위치 (출처 표시용)
+    )
+    chunks = splitter.split_documents(pages)
+    for i, chunk in enumerate(chunks):
+        chunk.metadata["chunk_index"] = i
+    return chunks
+
+
+def create_embeddings(model: str, dimension: int) -> GoogleGenerativeAIEmbeddings:
+    credentials, project = _vertex_credentials()
+    return GoogleGenerativeAIEmbeddings(
+        model=model,
+        vertexai=True,
+        credentials=credentials,
+        project=project,
+        location=EMBEDDING_LOCATION,
+        output_dimensionality=dimension,
+    )
+
+
+def embed_chunks(embeddings: GoogleGenerativeAIEmbeddings, chunks: list[Document]) -> list[list[float]]:
+    """3) 임베딩하기: 청크 텍스트 → 벡터 (embed_documents는 문서용 task_type으로 요청).
+
+    gemini-embedding-2는 배치 요청("only supports one content at a time")을 거부하므로
+    청크마다 따로 요청하고, 순서는 유지한 채 EMBEDDING_CONCURRENCY개씩 동시에 보낸다.
+    """
+    texts = [chunk.page_content for chunk in chunks]
+    with ThreadPoolExecutor(max_workers=EMBEDDING_CONCURRENCY) as pool:
+        return list(pool.map(lambda text: embeddings.embed_documents([text])[0], texts))
+
+
+def get_vector_store(embeddings: GoogleGenerativeAIEmbeddings, collection_name: str) -> PGVector:
+    """PostgreSQL(pgvector) 벡터 스토어. 처음 연결할 때 vector 확장과 테이블을 만든다."""
+    return PGVector(
+        embeddings=embeddings,
+        connection=PGVECTOR_URL,
+        collection_name=collection_name,
+        use_jsonb=True,
+    )
+
+
+def file_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def make_index_key(file_hash: str, content_settings: dict) -> str:
+    """같은 문서 판단 기준: 파일 내용 해시 + 저장 결과를 바꾸는 설정(청크 · 임베딩 · 이미지 읽기).
+
+    파일명은 넣지 않음 — 이름만 바뀐 같은 파일은 같은 문서, 이름이 같아도 내용이 바뀌면 다른 문서.
+    """
+    payload = json.dumps({"file_sha256": file_hash, **content_settings}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def get_collection_info(collection_name: str) -> dict | None:
+    """컬렉션 metadata(마지막 인덱싱 정보)와 실제 저장된 청크 수. 컬렉션이 없으면 None."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        row = conn.execute(
+            """
+            SELECT c.cmetadata,
+                   (SELECT count(*) FROM langchain_pg_embedding e WHERE e.collection_id = c.uuid)
+            FROM langchain_pg_collection c
+            WHERE c.name = %s
+            """,  # cmetadata는 json 타입이라 GROUP BY에 쓸 수 없어 청크 수는 서브쿼리로
+            (collection_name,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {**(row[0] or {}), "stored_chunks": row[1]}
+
+
+def find_same_index(collection_name: str, index_key: str) -> dict | None:
+    """같은 내용 · 같은 설정으로 이미 온전히 인덱싱돼 있으면 그 정보를, 아니면 None.
+
+    이미지 변환 실패가 있었거나 저장된 청크 수가 기록과 다르면(저장 도중 실패) 다시 인덱싱해야 하므로 None.
+    """
+    info = get_collection_info(collection_name)
+    if (
+        info is None
+        or info.get("index_key") != index_key
+        or info.get("image_failures", 0) > 0
+        or info.get("chunks") != info["stored_chunks"]
+    ):
+        return None
+    return info
+
+
+def save_to_store(
+    store: PGVector, chunks: list[Document], vectors: list[list[float]], index_info: dict,
+) -> list[str]:
+    """4) 벡터 스토어 저장: 컬렉션을 비우고 벡터 + 원문 + 출처(metadata)를 한 행으로 저장.
+
+    - add_documents는 내부에서 다시 임베딩하므로, 3단계에서 만든 벡터를 그대로 쓰는 add_embeddings 사용
+    - index_info(인덱싱 키 · 파일 해시 · 청크 수 등)는 청크 저장이 끝난 뒤 컬렉션 metadata에 기록
+      → 저장 도중 실패하면 키가 남지 않아 다음 인덱싱에서 잘못 건너뛰지 않음
+    """
+    store.delete_collection()
+    store.create_collection()
+    ids = store.add_embeddings(
+        texts=[chunk.page_content for chunk in chunks],
+        embeddings=vectors,
+        metadatas=[chunk.metadata for chunk in chunks],
+    )
+    info = {**index_info, "chunks": len(chunks), "indexed_at": datetime.now().isoformat(timespec="seconds")}
+    with psycopg.connect(DATABASE_URL) as conn:
+        conn.execute(
+            "UPDATE langchain_pg_collection SET cmetadata = %s WHERE name = %s",
+            (Jsonb(info), store.collection_name),
+        )
+    return ids
+
+
+@dataclass
+class StoredRow:
+    id: str
+    document: str
+    metadata: dict
+    dimension: int
+    vector_preview: str
+
+
+def inspect_collection(collection_name: str, limit: int = 5) -> tuple[int, list[StoredRow]]:
+    """저장 결과 확인: 컬렉션의 행 개수와 앞쪽 몇 행 (DB에 실제로 들어간 모습 그대로)."""
+    sql = """
+        SELECT e.id, e.document, e.cmetadata, vector_dims(e.embedding), left(e.embedding::text, 120)
+        FROM langchain_pg_embedding e
+        JOIN langchain_pg_collection c ON e.collection_id = c.uuid
+        WHERE c.name = %s
+        ORDER BY (e.cmetadata ->> 'chunk_index')::int NULLS LAST
+    """
+    with psycopg.connect(DATABASE_URL) as conn:
+        total = conn.execute(
+            """
+            SELECT count(*) FROM langchain_pg_embedding e
+            JOIN langchain_pg_collection c ON e.collection_id = c.uuid
+            WHERE c.name = %s
+            """,
+            (collection_name,),
+        ).fetchone()[0]
+        rows = conn.execute(sql + " LIMIT %s", (collection_name, limit)).fetchall()
+    return total, [StoredRow(r[0], r[1], r[2], r[3], r[4] + " …") for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# B. 질문에 답하기 (런타임)
+# ---------------------------------------------------------------------------
+
+
+def embed_question(embeddings: GoogleGenerativeAIEmbeddings, question: str) -> list[float]:
+    """1) 질문 입력: 질문도 같은 모델로 임베딩 (embed_query는 질문용 task_type으로 요청)."""
+    return embeddings.embed_query(question)
+
+
+def search_chunks(store: PGVector, question_vector: list[float], k: int) -> list[tuple[Document, float]]:
+    """2) 관련 청크 검색: 코사인 거리가 가까운 순으로 k개 (거리 0 = 같은 방향, 작을수록 관련 높음)."""
+    return store.similarity_search_with_score_by_vector(question_vector, k=k)
+
+
+def format_context(docs: list[Document]) -> str:
+    """검색된 청크를 번호 · 출처와 함께 프롬프트에 넣을 문자열로."""
+    return "\n\n".join(
+        f"[{i}] ({doc.metadata.get('source', '?')} p.{doc.metadata.get('page', '?')})\n{doc.page_content}"
+        for i, doc in enumerate(docs, start=1)
+    )
+
+
+def build_prompt(instructions: str, docs: list[Document], question: str) -> list[BaseMessage]:
+    """3) 프롬프트 구성: 지시문 + 원문(검색된 청크) + 원래 질문."""
+    return PROMPT_TEMPLATE.format_messages(
+        instructions=instructions,
+        context=format_context(docs),
+        question=question,
+    )
+
+
+def create_llm(model: str, max_output_tokens: int = MAX_OUTPUT_TOKENS) -> ChatGoogleGenerativeAI:
+    credentials, project = _vertex_credentials()
+    return ChatGoogleGenerativeAI(
+        model=model,
+        vertexai=True,
+        credentials=credentials,
+        project=project,
+        location=LLM_LOCATION,
+        reasoning_effort="low",  # 근거 문서를 읽고 정리하는 작업이라 깊은 추론은 불필요
+        max_output_tokens=max_output_tokens,
+        timeout=120,
+        max_retries=3,
+    )
+
+
+def create_ollama_llm(model: str, max_output_tokens: int = MAX_OUTPUT_TOKENS) -> BaseChatModel:
+    """로컬 Ollama 모델 (chat_app과 같은 설정). Gemma 선택 시에만 필요하므로 지연 import."""
+    from langchain_ollama import ChatOllama
+
+    return ChatOllama(model=model, temperature=0, num_predict=max_output_tokens)
+
+
+def generate_answer(llm: BaseChatModel, messages: list[BaseMessage]):
+    """4) LLM → 답변: 구성된 프롬프트를 그대로 보내 AIMessage(본문 + 토큰 사용량)를 받음."""
+    return llm.invoke(messages)
+
+
+def build_rag_chain(store: PGVector, llm: BaseChatModel, instructions: str, k: int) -> Runnable:
+    """B의 1~4를 하나로 연결한 LCEL 체인. 입력: 질문 문자열 → 출력: 답변 문자열.
+
+    - context: 질문 → retriever(질문 임베딩 + 벡터 검색) → 청크 문자열
+    - question: RunnablePassthrough로 원래 질문을 그대로 프롬프트에 전달 (그림의 "원래 질문도 그대로 전달")
+    """
+    retriever = store.as_retriever(search_kwargs={"k": k})
+    return (
+        {"context": retriever | RunnableLambda(format_context), "question": RunnablePassthrough()}
+        | PROMPT_TEMPLATE.partial(instructions=instructions)
+        | llm
+        | StrOutputParser()
+    )
+
+
+def pdf_name_is_valid(file_name: str) -> bool:
+    return Path(file_name).suffix.lower() == ".pdf"

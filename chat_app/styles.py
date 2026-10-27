@@ -228,6 +228,49 @@ header[data-testid="stHeader"] { background: transparent !important; }
     font-size: 0.78rem;
 }
 
+/* ---------------- 날씨 카드 (weather_card.py) ---------------- */
+.gm-wx { padding: 8px 0 4px; color: var(--gm-text); }
+.gm-wx-radio { display: none; }
+.gm-wx-place { font-size: 0.95rem; color: var(--gm-text); margin-bottom: 10px; }
+.gm-wx-now { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.gm-wx-temp { font-size: 3.6rem; line-height: 1; font-weight: 400; }
+.gm-wx-unit { font-size: 1.4rem; align-self: flex-start; margin-top: 6px; margin-left: -8px; }
+.gm-wx-details { margin-left: auto; font-size: 0.85rem; color: var(--gm-text-muted); line-height: 1.6; text-align: right; }
+.gm-wx-summary { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 14px; }
+.gm-wx-cond { font-size: 1.4rem; font-weight: 500; }
+.gm-wx-range { font-size: 0.95rem; margin-top: 4px; }
+.gm-wx-tabs { display: flex; gap: 4px; }
+.gm-wx-tab {
+    padding: 8px 16px; border-radius: 20px; cursor: pointer;
+    font-size: 0.9rem; color: var(--gm-text-muted);
+}
+.gm-wx-tab:hover { background: var(--gm-surface-hover); }
+.gm-wx-radio-temp:checked ~ .gm-wx-summary .gm-wx-tab-temp,
+.gm-wx-radio-rain:checked ~ .gm-wx-summary .gm-wx-tab-rain,
+.gm-wx-radio-wind:checked ~ .gm-wx-summary .gm-wx-tab-wind { background: var(--gm-surface); color: var(--gm-text); }
+.gm-wx-hourly { margin-top: 18px; overflow-x: auto; scrollbar-width: thin; }
+.gm-wx-panel { display: none; gap: 4px; width: max-content; }
+.gm-wx-radio-temp:checked ~ .gm-wx-hourly .gm-wx-panel-temp,
+.gm-wx-radio-rain:checked ~ .gm-wx-hourly .gm-wx-panel-rain,
+.gm-wx-radio-wind:checked ~ .gm-wx-hourly .gm-wx-panel-wind { display: flex; }
+.gm-wx-hour {
+    width: 68px; display: flex; flex-direction: column; align-items: center; gap: 10px;
+    font-size: 0.9rem;
+}
+.gm-wx-hour img { display: block; }
+.gm-wx-time { white-space: nowrap; }
+.gm-wx-pop { color: var(--gm-accent); font-size: 0.85rem; }
+.gm-wx-val { font-size: 1rem; }
+.gm-wx-val small { font-size: 0.7rem; color: var(--gm-text-muted); margin-left: 1px; }
+.gm-wx-bar-wrap { height: 48px; display: flex; align-items: flex-end; }
+.gm-wx-bar { width: 14px; background: var(--gm-accent); border-radius: 4px 4px 0 0; }
+.gm-wx-arrow { height: 36px; display: flex; align-items: center; }
+.gm-wx-source { margin-top: 14px; font-size: 0.78rem; color: var(--gm-text-muted); }
+.gm-wx-source a { color: var(--gm-text-muted) !important; }
+@media (max-width: 640px) {
+    .gm-wx-details { margin-left: 0; text-align: left; width: 100%; }
+}
+
 /* ---------------- 입력창 (둥근 pill) ---------------- */
 [data-testid="stBottom"], [data-testid="stBottom"] > div { background: var(--gm-bg) !important; }
 [data-testid="stChatInput"] {

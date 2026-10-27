@@ -122,3 +122,49 @@ def get_usage_totals() -> dict:
             FROM chat_messages WHERE role = 'assistant'
             """
         ).fetchone()
+
+
+# 대시보드 기간 단위 (date_trunc 인자로 그대로 쓰므로 이 목록의 값만 허용)
+USAGE_PERIODS = ("day", "week", "month")
+USAGE_TIMEZONE = "Asia/Seoul"
+
+
+def get_usage_by_period(period: str, start, end) -> list[dict]:
+    """
+    기간(일 · 주 · 월) × 모델별 사용량 합계를 반환합니다. start ~ end(날짜, 양 끝 포함)는 한국 시간 기준.
+    주는 월요일 시작 (PostgreSQL date_trunc('week') 기준).
+    """
+    if period not in USAGE_PERIODS:
+        raise ValueError(f"period must be one of {USAGE_PERIODS}")
+    with get_db_pool().connection() as conn:
+        return conn.execute(
+            """
+            SELECT date_trunc(%(period)s, created_at AT TIME ZONE %(tz)s)::date      AS period,
+                   COALESCE(meta->>'model', '알 수 없음')                             AS model,
+                   COUNT(*)                                                          AS responses,
+                   COALESCE(SUM((meta->>'in_tokens')::bigint), 0)                    AS in_tokens,
+                   COALESCE(SUM((meta->>'out_tokens')::bigint), 0)                   AS out_tokens,
+                   COALESCE(SUM((meta->>'reasoning_tokens')::bigint), 0)             AS reasoning_tokens,
+                   COALESCE(SUM((meta->>'total_tokens')::bigint), 0)                 AS total_tokens,
+                   COALESCE(SUM((meta->>'cost_usd')::float8), 0)                     AS cost_usd
+            FROM chat_messages
+            WHERE role = 'assistant'
+              AND (created_at AT TIME ZONE %(tz)s)::date BETWEEN %(start)s AND %(end)s
+            GROUP BY 1, 2
+            ORDER BY 1, 2
+            """,
+            {"period": period, "tz": USAGE_TIMEZONE, "start": start, "end": end},
+        ).fetchall()
+
+
+def get_usage_date_bounds() -> dict:
+    """사용 기록이 있는 첫날 · 마지막 날 (한국 시간). 기록이 없으면 둘 다 None."""
+    with get_db_pool().connection() as conn:
+        return conn.execute(
+            """
+            SELECT MIN((created_at AT TIME ZONE %(tz)s)::date) AS first_day,
+                   MAX((created_at AT TIME ZONE %(tz)s)::date) AS last_day
+            FROM chat_messages WHERE role = 'assistant'
+            """,
+            {"tz": USAGE_TIMEZONE},
+        ).fetchone()

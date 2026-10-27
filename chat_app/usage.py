@@ -44,6 +44,15 @@ def sum_token_usage(turn_messages: list[BaseMessage], user_input: str, response_
     return in_tokens, out_tokens, total_tokens
 
 
+def sum_reasoning_tokens(turn_messages: list[BaseMessage]) -> int:
+    """이번 턴의 추론(thinking) 토큰 합계 (출력 토큰에 포함된 값, 사고 수준 효과 확인용)."""
+    total = 0
+    for m in turn_messages:
+        if isinstance(m, AIMessage) and m.usage_metadata:
+            total += (m.usage_metadata.get("output_token_details") or {}).get("reasoning", 0) or 0
+    return total
+
+
 def estimate_cost(model_name: str, in_tokens: int, out_tokens: int) -> tuple[float, str]:
     """(USD 비용, 화면 표시 문자열)을 반환합니다. Gemini Flash 요율 기준, 로컬 모델은 무료."""
     if not is_gemini(model_name):
