@@ -318,7 +318,7 @@ def create_llm(model: str, max_output_tokens: int = MAX_OUTPUT_TOKENS) -> ChatGo
         reasoning_effort="low",  # 근거 문서를 읽고 정리하는 작업이라 깊은 추론은 불필요
         max_output_tokens=max_output_tokens,
         timeout=120,
-        max_retries=1,
+        max_retries=3,
     )
 
 
