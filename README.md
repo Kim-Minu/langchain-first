@@ -60,6 +60,23 @@ uv run streamlit run rag_app/app.py
 
 청크 크기 · 겹침 · top-k · 지시문 등은 사이드바에서 바꿀 수 있습니다. 기획 · 설계 문서: [docs/rag-pdf-pipeline/](docs/rag-pdf-pipeline/01-plan.md)
 
+| 화면 | 파일 | 내용 |
+| --- | --- | --- |
+| PDF RAG 실습 | `rag_app/app.py` | PDF 업로드 → 인덱싱 4단계 · 질문 4단계의 출력값 확인, 답변 모델 Gemini / Ollama Gemma 선택, 스캔 PDF는 Gemini 이미지 읽기 |
+| OCR · RAG 평가 | `rag_app/pages/ocr_eval.py` | 스캔 PDF를 Gemini OCR(사진 · 그림 제외)로 읽어 인덱싱 → 질문 · 정답 세트로 정답률 · 검색 순위 측정 → 설정별 비교 |
+
+두 화면은 같은 사이드바 설정을 공유하며, 앱 왼쪽 메뉴에서 전환합니다 (`app` · `ocr eval`).
+
+#### OCR · RAG 평가 화면 사용 순서
+
+1. 평가 문서를 `rag_app/eval/data/han-gang_1-20.pdf`에 둡니다. 이 폴더는 저작물(책 스캔본)과 OCR 결과를 담아 git에서 제외되어 있습니다. 다른 PDF는 화면에서 업로드해도 됩니다.
+2. **1. OCR · 인덱싱** 탭: `OCR 실행` → 원본 페이지와 OCR 결과를 나란히 확인 → `인덱싱 실행`. OCR 결과는 파일 · 모델 · 프롬프트별로 `eval/data/`에 캐시되어 다시 실행해도 API를 호출하지 않습니다.
+3. **2. 질문 · 정답** 탭: 평가 세트 `rag_app/eval/han_gang_qa.json`(20문항)을 확인 · 수정합니다. Gemini로 새로 생성할 수도 있습니다.
+4. **3. RAG 평가** 탭: 질문 세트(원문 질문 / 사용자 말투 질문)를 고르고 `평가 실행`. 점수 · 정답 페이지 검색률 · MRR과 문항별 판정이 나옵니다.
+5. 사이드바 설정(청크 크기, 페이지 연결, top-k 등)을 바꾸고 다시 인덱싱 · 평가하면 **4. 실행 비교** 탭에 결과가 쌓입니다.
+
+평가 결과와 개선 기록: [docs/rag-pdf-pipeline/04-evaluation.md](docs/rag-pdf-pipeline/04-evaluation.md)
+
 Vertex AI 예제는 GCP 프로젝트 ID가 코드에 `project="iceu-songpa05"`로 지정되어 있으니, 본인 프로젝트로 바꿔서 사용하세요.
 
 ## 예제
