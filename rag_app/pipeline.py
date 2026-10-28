@@ -31,6 +31,7 @@ import psycopg
 import pypdf
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
@@ -43,6 +44,7 @@ from psycopg.types.json import Jsonb
 
 from rag_app.config import (
     DATABASE_URL,
+    EMBEDDING_CACHE,
     EMBEDDING_CONCURRENCY,
     EMBEDDING_LOCATION,
     GOOGLE_CLOUD_PROJECT,
@@ -251,9 +253,87 @@ def split_documents(
     return chunks
 
 
-def create_embeddings(model: str, dimension: int) -> GoogleGenerativeAIEmbeddings:
+EMBEDDING_CACHE_DDL = """
+    CREATE TABLE IF NOT EXISTS embedding_cache (
+        model       TEXT NOT NULL,
+        dimension   INT NOT NULL,
+        task_type   TEXT NOT NULL,
+        text_sha256 TEXT NOT NULL,
+        embedding   REAL[] NOT NULL,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (model, dimension, task_type, text_sha256)
+    )
+"""
+DOCUMENT_TASK, QUERY_TASK = "RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY"
+
+
+class CachedEmbeddings(Embeddings):
+    """Gemini 임베딩 앞에 PostgreSQL 캐시(embedding_cache 테이블)를 둔 래퍼.
+
+    - 키: 모델 + 차원 + task_type + 텍스트 sha256. gemini-embedding-2는 문서용(RETRIEVAL_DOCUMENT)과
+      질문용(RETRIEVAL_QUERY) 벡터가 다르고 차원별로도 다르므로 모두 키에 넣음
+    - 여러 텍스트는 한 번의 쿼리로 조회하고, 없는 것만 Gemini에 요청한 뒤 저장
+    - gemini-embedding-2는 배치 요청("only supports one content at a time")을 거부하므로
+      캐시에 없는 텍스트는 하나씩, 순서를 유지한 채 EMBEDDING_CONCURRENCY개씩 동시에 요청
+    - 같은 DB를 쓰므로 두 화면 · 평가 스크립트가 캐시를 공유하고 앱을 재시작해도 남음
+    """
+
+    def __init__(self, inner: Embeddings, model: str, dimension: int, enabled: bool = True):
+        self.inner = inner
+        self.model = model
+        self.dimension = dimension
+        self.enabled = enabled
+        if enabled:
+            with psycopg.connect(DATABASE_URL) as conn:
+                conn.execute(EMBEDDING_CACHE_DDL)
+
+    def _lookup(self, task: str, hashes: list[str]) -> dict[str, list[float]]:
+        with psycopg.connect(DATABASE_URL) as conn:
+            rows = conn.execute(
+                "SELECT text_sha256, embedding FROM embedding_cache"
+                " WHERE model = %s AND dimension = %s AND task_type = %s AND text_sha256 = ANY(%s)",
+                (self.model, self.dimension, task, hashes),
+            ).fetchall()
+        return dict(rows)
+
+    def _save(self, task: str, items: list[tuple[str, list[float]]]) -> None:
+        with psycopg.connect(DATABASE_URL) as conn, conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO embedding_cache (model, dimension, task_type, text_sha256, embedding)"
+                " VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                [(self.model, self.dimension, task, h, vector) for h, vector in items],
+            )
+
+    def embed_documents_with_stats(self, texts: list[str]) -> tuple[list[list[float]], int]:
+        """문서용 벡터와 캐시에서 가져온 개수."""
+        hashes = [hashlib.sha256(text.encode()).hexdigest() for text in texts]
+        cached = self._lookup(DOCUMENT_TASK, list(set(hashes))) if self.enabled and texts else {}
+        missing = list({h: text for h, text in zip(hashes, texts, strict=True) if h not in cached}.items())
+        with ThreadPoolExecutor(max_workers=EMBEDDING_CONCURRENCY) as pool:
+            fresh = list(pool.map(lambda item: self.inner.embed_documents([item[1]])[0], missing))
+        computed = {h: vector for (h, _), vector in zip(missing, fresh, strict=True)}
+        if self.enabled and computed:
+            self._save(DOCUMENT_TASK, list(computed.items()))
+        hits = sum(h in cached for h in hashes)
+        return [cached.get(h) or computed[h] for h in hashes], hits
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self.embed_documents_with_stats(texts)[0]
+
+    def embed_query(self, text: str) -> list[float]:
+        if not self.enabled:
+            return self.inner.embed_query(text)
+        h = hashlib.sha256(text.encode()).hexdigest()
+        if cached := self._lookup(QUERY_TASK, [h]).get(h):
+            return cached
+        vector = self.inner.embed_query(text)
+        self._save(QUERY_TASK, [(h, vector)])
+        return vector
+
+
+def create_embeddings(model: str, dimension: int) -> CachedEmbeddings:
     credentials, project = _vertex_credentials()
-    return GoogleGenerativeAIEmbeddings(
+    gemini = GoogleGenerativeAIEmbeddings(
         model=model,
         vertexai=True,
         credentials=credentials,
@@ -261,20 +341,21 @@ def create_embeddings(model: str, dimension: int) -> GoogleGenerativeAIEmbedding
         location=EMBEDDING_LOCATION,
         output_dimensionality=dimension,
     )
+    return CachedEmbeddings(gemini, model, dimension, enabled=EMBEDDING_CACHE)
 
 
-def embed_chunks(embeddings: GoogleGenerativeAIEmbeddings, chunks: list[Document]) -> list[list[float]]:
-    """3) 임베딩하기: 청크 텍스트 → 벡터 (embed_documents는 문서용 task_type으로 요청).
+def embed_chunks(embeddings: Embeddings, chunks: list[Document]) -> tuple[list[list[float]], int]:
+    """3) 임베딩하기: 청크 텍스트 → 벡터 (문서용 task_type). 반환: (벡터, 캐시에서 가져온 개수).
 
-    gemini-embedding-2는 배치 요청("only supports one content at a time")을 거부하므로
-    청크마다 따로 요청하고, 순서는 유지한 채 EMBEDDING_CONCURRENCY개씩 동시에 보낸다.
+    CachedEmbeddings면 같은 텍스트의 벡터를 캐시에서 재사용하고 나머지만 Gemini에 요청.
     """
     texts = [chunk.page_content for chunk in chunks]
-    with ThreadPoolExecutor(max_workers=EMBEDDING_CONCURRENCY) as pool:
-        return list(pool.map(lambda text: embeddings.embed_documents([text])[0], texts))
+    if isinstance(embeddings, CachedEmbeddings):
+        return embeddings.embed_documents_with_stats(texts)
+    return embeddings.embed_documents(texts), 0
 
 
-def get_vector_store(embeddings: GoogleGenerativeAIEmbeddings, collection_name: str) -> PGVector:
+def get_vector_store(embeddings: Embeddings, collection_name: str) -> PGVector:
     """PostgreSQL(pgvector) 벡터 스토어. 처음 연결할 때 vector 확장과 테이블을 만든다."""
     return PGVector(
         embeddings=embeddings,
@@ -391,7 +472,7 @@ def inspect_collection(collection_name: str, limit: int = 5) -> tuple[int, list[
 # ---------------------------------------------------------------------------
 
 
-def embed_question(embeddings: GoogleGenerativeAIEmbeddings, question: str) -> list[float]:
+def embed_question(embeddings: Embeddings, question: str) -> list[float]:
     """1) 질문 입력: 질문도 같은 모델로 임베딩 (embed_query는 질문용 task_type으로 요청)."""
     return embeddings.embed_query(question)
 

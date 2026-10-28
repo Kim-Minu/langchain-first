@@ -51,7 +51,8 @@ def page_image(data: bytes, page_no: int):
 def run_label(question_set: str) -> str:
     return (
         f"{settings.chunk_size}/{settings.chunk_overlap}"
-        f"{' 페이지연결' if settings.across_pages else ''} · k={settings.top_k} · {settings.answer_model} · {question_set}"
+        f"{' 페이지연결' if settings.across_pages else ''} · k={settings.top_k} · 답변 {settings.answer_model}"
+        f" · 채점 {settings.judge_model} · {question_set}"
     )
 
 
@@ -154,14 +155,17 @@ with tab_ocr:
                     with st.spinner("청크 · 임베딩 · 저장 중…"):
                         chunks = rag.split_documents(pages, settings.chunk_size, settings.chunk_overlap, settings.across_pages)
                         store = get_store(settings.embedding_model, settings.embedding_dim, settings.collection)
-                        vectors = rag.embed_chunks(store.embeddings, chunks)
+                        vectors, cache_hits = rag.embed_chunks(store.embeddings, chunks)
                         rag.save_to_store(
                             store, chunks, vectors,
                             {"index_key": index_key, "file_sha256": ocr["sha"], "file_name": ocr["file_name"],
                              "settings": content_settings, "image_failures": len(ocr["failures"])},
                         )
                     multi = sum(c.metadata.get("page_end", c.metadata["page"]) != c.metadata["page"] for c in chunks)
-                    st.success(f"청크 {len(chunks)}개 저장 (여러 페이지에 걸친 청크 {multi}개)")
+                    st.success(
+                        f"청크 {len(chunks)}개 저장 (여러 페이지에 걸친 청크 {multi}개) · "
+                        f"임베딩 캐시 사용 {cache_hits}개 / 새로 계산 {len(chunks) - cache_hits}개"
+                    )
             except Exception as e:
                 show_error("인덱싱", e)
         try:
@@ -184,15 +188,20 @@ with tab_qa:
     )
     edited = st.data_editor(
         pd.DataFrame([asdict(item) for item in st.session_state["eval_qa"]],
-                     columns=["id", "page", "question", "paraphrase", "answer", "note"]),
+                     columns=["id", "answerable", "page", "question", "paraphrase", "answer", "note"]),
         num_rows="dynamic", width="stretch", height=420, key="qa_editor",
-        column_config={"id": st.column_config.NumberColumn(width="small"), "page": st.column_config.NumberColumn(width="small")},
+        column_config={
+            "id": st.column_config.NumberColumn(width="small"),
+            "answerable": st.column_config.CheckboxColumn("답 있음", width="small", default=True,
+                                                          help=f"끄면 문서에 답이 없는 질문 (정답 '{config.UNANSWERABLE}', page 0)"),
+            "page": st.column_config.NumberColumn(width="small"),
+        },
     )
     c1, c2, c3 = st.columns([1, 1, 2])
     if c1.button("파일에 저장"):
         items = [
             ev.QAItem(id=int(r.id), question=str(r.question), answer=str(r.answer), page=int(r.page),
-                      note=str(r.note or ""), paraphrase=str(r.paraphrase or ""))
+                      note=str(r.note or ""), paraphrase=str(r.paraphrase or ""), answerable=bool(r.answerable))
             for r in edited.dropna(subset=["question", "answer", "page"]).itertuples()
         ]
         ev.save_qa(config.EVAL_QA_FILE, items)
@@ -233,6 +242,8 @@ with tab_eval:
         "질문 세트", ["원문 질문", "사용자 말투 질문"], horizontal=True,
         help="원문 질문은 생성 당시 문서 표현을 그대로 써서 검색이 쉬움. 사용자 말투 질문이 실제 상황에 가까움",
     )
+    if settings.judge_model == settings.answer_model:
+        st.warning("채점 모델이 답변 모델과 같습니다. 자기 답에 후한 편향이 생길 수 있어 사이드바 C에서 다른 모델을 권장합니다.")
     if st.button(f"{len(items)}개 질문 평가 실행", type="primary", disabled=not items or not info.get("stored_chunks")):
         progress = st.progress(0.0, text="평가 중…")
         try:
@@ -240,7 +251,7 @@ with tab_eval:
                 items,
                 get_store(settings.embedding_model, settings.embedding_dim, settings.collection),
                 get_answer_llm(settings.llm_choice, settings.llm_model, settings.max_output_tokens),
-                get_llm(settings.llm_model, 4096),
+                get_llm(settings.judge_model, 8192),
                 settings.instructions,
                 settings.top_k,
                 use_paraphrase=question_set == "사용자 말투 질문",
@@ -249,7 +260,8 @@ with tab_eval:
             run = {"label": run_label(question_set), "summary": ev.summarize(results), "results": results,
                    "settings": {"chunk_size": settings.chunk_size, "chunk_overlap": settings.chunk_overlap,
                                 "across_pages": settings.across_pages, "top_k": settings.top_k,
-                                "answer_model": settings.answer_model, "question_set": question_set}}
+                                "answer_model": settings.answer_model, "judge_model": settings.judge_model,
+                                "question_set": question_set}}
             st.session_state.setdefault("eval_runs", []).append(run)
             progress.empty()
         except Exception as e:
@@ -262,26 +274,53 @@ with tab_eval:
         summary = run["summary"]
         st.divider()
         step_header("3-1", "결과 요약", run["label"])
-        c = st.columns(6)
-        c[0].metric("점수", f"{summary['score']:.2f}", help="정답 1 · 부분 0.5 · 오답 0의 평균")
+        fmt = lambda v, f: "-" if v is None else format(v, f)
+        st.markdown("**답변**")
+        c = st.columns(5)
+        c[0].metric("점수 (답 있는 질문)", f"{summary['score']:.2f}", help="정답 1 · 부분 0.5 · 오답 0의 평균")
         c[1].metric("정답 / 부분 / 오답", f"{summary['correct']} / {summary['partial']} / {summary['incorrect']}")
-        c[2].metric("오류", summary["error"])
-        c[3].metric("정답 페이지 검색률", f"{summary['page_hit_rate']:.0%}")
-        c[4].metric("MRR", f"{summary['mrr']:.3f}", help="정답 페이지 청크 순위의 역수 평균 (1위 1, 2위 0.5, 못 찾음 0)")
-        c[5].metric("평균 답변 시간", f"{summary['avg_latency']}초")
-        st.dataframe(
-            pd.DataFrame(
-                [{"id": r.id, "판정": VERDICT_MARK[r.verdict], "정답 쪽": r.gold_page, "검색 순위": r.gold_rank or "-",
-                  "검색된 쪽": ", ".join(f"{x['page']}" + (f"~{x['page_end']}" if x["page_end"] != x["page"] else "") for x in r.retrieved),
-                  "질문": r.question, "답변": preview(r.answer, 80), "판정 이유": r.reason}
-                 for r in run["results"]]
-            ),
-            hide_index=True, width="stretch",
+        c[2].metric("거절 정확도", fmt(summary.get("refusal_accuracy"), ".0%"),
+                    help="문서에 답이 없는 질문에 '찾을 수 없다'고 답한 비율 (지어내지 않는지)")
+        c[3].metric("근거 충실도", fmt(summary.get("faithfulness"), ".2f"),
+                    help="답변의 사실 주장 중 검색된 문맥에 근거한 비율의 평균 (환각 측정, 정답 데이터 불필요)")
+        c[4].metric("근거 없는 주장이 있는 답변", summary.get("unsupported_answers", 0))
+        st.markdown("**검색 · 실행**")
+        c = st.columns(5)
+        c[0].metric("정답 페이지 검색률", f"{summary['page_hit_rate']:.0%}")
+        c[1].metric("MRR", f"{summary['mrr']:.3f}", help="정답 페이지 청크 순위의 역수 평균 (1위 1, 2위 0.5, 못 찾음 0)")
+        c[2].metric("평균 답변 시간", f"{summary['avg_latency']}초")
+        c[3].metric("오류", summary["error"])
+        agreement_slot = c[4].empty()
+
+        # 사람 확인: '사람 판정' 칸을 채우면 LLM 채점과의 일치율을 계산 (채점을 믿어도 되는지 확인)
+        table = pd.DataFrame(
+            [{"id": r.id, "유형": "답 있음" if r.answerable else "답 없음", "판정": VERDICT_MARK[r.verdict],
+              "사람 판정": None, "근거 충실도": r.faithfulness, "정답 쪽": r.gold_page or "-",
+              "검색 순위": r.gold_rank or "-",
+              "검색된 쪽": ", ".join(f"{x['page']}" + (f"~{x['page_end']}" if x["page_end"] != x["page"] else "") for x in r.retrieved),
+              "질문": r.question, "답변": preview(r.answer, 80), "판정 이유": r.reason}
+             for r in run["results"]]
         )
+        reviewed = st.data_editor(
+            table, hide_index=True, width="stretch", key=f"human_review_{len(runs)}",
+            disabled=[col for col in table.columns if col != "사람 판정"],
+            column_config={"사람 판정": st.column_config.SelectboxColumn(
+                options=list(VERDICT_MARK.values())[:3], help="직접 판정해 LLM 채점과 비교 (일부만 채워도 됨)")},
+        )
+        filled = reviewed[reviewed["사람 판정"].notna()]
+        if len(filled):
+            agree = (filled["사람 판정"] == filled["판정"]).mean()
+            agreement_slot.metric("사람 · LLM 채점 일치율", f"{agree:.0%}", help=f"사람이 판정한 {len(filled)}문항 기준")
+        else:
+            agreement_slot.metric("사람 · LLM 채점 일치율", "-", help="표의 '사람 판정' 칸을 채우면 계산")
+
         for r in run["results"]:
-            if r.verdict != "correct":
-                with st.expander(f"{VERDICT_MARK[r.verdict]} {r.id}번 · {r.question}"):
+            if r.verdict != "correct" or r.unsupported:
+                title = f"{VERDICT_MARK[r.verdict]} {r.id}번 · {r.question}" + (" · ⚠️ 근거 없는 주장" if r.unsupported else "")
+                with st.expander(title):
                     st.markdown(f"**정답 (p.{r.gold_page})** {r.gold}\n\n**답변** {r.answer}\n\n**판정 이유** {r.reason}")
+                    if r.unsupported:
+                        st.markdown("**검색된 문맥에 근거가 없는 주장**\n" + "\n".join(f"- {c}" for c in r.unsupported))
                     st.json(r.retrieved)
         st.download_button(
             "결과 JSON 내려받기",

@@ -160,6 +160,21 @@ erDiagram
     }
 ```
 
+### 임베딩 캐시
+
+`embedding_cache` 테이블(같은 DB)에 텍스트별 벡터를 저장해 두 화면 · 평가가 공유합니다. 앱을 재시작해도 남습니다.
+
+| 컬럼 | 설명 |
+| --- | --- |
+| `model`, `dimension`, `task_type`, `text_sha256` | 기본 키. 문서용(`RETRIEVAL_DOCUMENT`) · 질문용(`RETRIEVAL_QUERY`) 벡터와 출력 차원별 벡터가 서로 다르므로 모두 키에 포함 |
+| `embedding` | `REAL[]` (Gemini가 float32로 돌려주므로 정밀도 손실 없음) |
+
+| 상황 | 효과 (실측) |
+| --- | --- |
+| 같은 청크 재인덱싱 (컬렉션 이름 변경, 이미지 실패 후 재인덱싱 등) | 26청크 2.2초 → 0.0초, API 호출 0회 |
+| 같은 질문 재평가 · 재질문 | 질문 임베딩 0.48초 → 0.02초 |
+| 청크 크기 변경 | 청크 텍스트가 달라져 거의 재사용 안 됨 |
+
 ## 6. 주요 설계 결정
 
 | 결정 | 이유 |
@@ -173,7 +188,9 @@ erDiagram
 | OCR은 기존 `GeminiImageReader`를 OCR 프롬프트로 재사용, 결과는 파일 캐시 | 스캔 페이지 = 이미지 1장이라 이미지 읽기와 같은 경로. `[이미지 설명]` 표시만 생략(`mark=None`). 20쪽 OCR에 약 3분이 걸려 파일 · 모델 · 프롬프트별로 캐시하고, 실패한 쪽이 있으면 저장하지 않음 |
 | 평가 세트에 사용자 말투 질문을 함께 둠 | LLM이 만든 질문은 문서 문장을 그대로 따라 써서 검색이 실제보다 쉬움(원문 1.00 vs 말투 0.90). 같은 정답으로 두 세트를 평가 |
 | 채점은 LLM, 검색은 정답 쪽 포함 여부 · 순위로 따로 측정 | 답변 실패가 검색 때문인지 생성 때문인지 구분하기 위함 |
+| 평가를 검색 · 생성 · 전체 3층으로: 근거 충실도와 거절 정확도 추가, 채점 모델 분리 | RAG 평가 관례(Ragas · TruLens의 faithfulness/groundedness, 답이 없는 질문). 채점 모델이 답변 모델과 같으면 자기 답에 후한 편향이 있어 Pro 계열로 분리 (`gemini-4-argon`은 이 프로젝트에서 403). 사람 판정과의 일치율로 LLM 채점을 검증 |
 | 쪽을 넘어 이어서 청크 나누기 (옵션, 기본 꺼짐) | 쪽 경계에서 끊긴 문장(욱/리하 등)을 한 청크로. 앞 쪽이 문장 끝으로 끝나지 않으면 띄어 쓰지 않고 붙임. 효과는 미검증이라 기본값은 유지 |
+| 임베딩 캐시는 LangChain `CacheBackedEmbeddings` 대신 PostgreSQL 테이블로 직접 | 이미 쓰는 DB라 두 화면 · 스크립트가 공유하고 재시작해도 남음. 표준 `Embeddings` 인터페이스를 따르는 `CachedEmbeddings` 래퍼라 PGVector · 검색기 · 체인에 그대로 사용. 키에 task_type · 차원을 반드시 포함 (빠지면 질문에 문서용 벡터가 재사용됨). 여러 텍스트는 한 번에 조회하고 없는 것만 요청 · 같은 배치 안 중복 텍스트는 한 번만 요청 |
 | 청크마다 따로 임베딩 요청 + 스레드 동시 요청 (`EMBEDDING_CONCURRENCY`, 기본 8) | Vertex AI의 `gemini-embedding-2`는 요청 한 번에 텍스트 하나만 받는다(배치 시 "only supports one content at a time" 오류). 순서를 유지한 채 동시에 보내 인덱싱 시간을 줄임 |
 | 문서용 · 질문용 임베딩 분리 (`embed_documents` / `embed_query`) | Gemini 임베딩은 `task_type`(RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY)에 따라 검색에 최적화된 벡터를 만든다. LangChain이 메서드별로 자동 지정 |
 | 지시문을 템플릿 문자열이 아니라 변수(`{instructions}`)로 주입 | 사용자가 고친 지시문에 `{ }`가 들어가도 템플릿 변수로 해석되지 않음 |
@@ -192,8 +209,10 @@ erDiagram
 | `GOOGLE_CLOUD_PROJECT` | ADC 기본 프로젝트 | Vertex AI 프로젝트 |
 | `RAG_EMBEDDING_MODEL` | `gemini-embedding-2` | 임베딩 모델 |
 | `RAG_EMBEDDING_LOCATION` | `global` | 임베딩 엔드포인트 리전 (`gemini-embedding-2`는 `global` 전용) |
+| `RAG_EMBEDDING_CACHE` | `1` | 임베딩 캐시 사용 (`0`이면 끔) |
 | `RAG_EMBEDDING_CONCURRENCY` | `8` | 임베딩 동시 요청 수 (할당량 초과 시 낮춤) |
 | `RAG_IMAGE_CONCURRENCY` | `4` | 이미지 변환 동시 요청 수 |
+| `RAG_JUDGE_MODEL` | `gemini-3.1-pro-preview` | 평가 채점 · 근거 충실도 판정 모델 (미리보기 모델이라 바뀔 수 있음) |
 | `RAG_EVAL_CONCURRENCY` | `2` | 평가 동시 실행 문항 수 (문항마다 답변 + 채점 2회 호출) |
 | `RAG_LLM_MODEL` | `GEMINI_MODEL` 또는 `gemini-3.8-flash` | 답변 모델 |
 | `RAG_LLM_LOCATION` | `GOOGLE_CLOUD_LOCATION` 또는 `global` | 답변 모델 엔드포인트 |

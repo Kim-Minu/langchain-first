@@ -5,7 +5,8 @@
     "paraphrase": "파리나 런던 시내를 흐르는 강들은 폭이 얼마나 돼?",
     "answer": "대개 200m에서 250m 정도입니다.",
     "page": 1,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
   },
   {
     "id": 2,
@@ -13,7 +14,8 @@
     "paraphrase": "서울은 왜 강을 경계로 삼지 않고 강 양쪽으로 도시가 커졌어?",
     "answer": "6·25전쟁 때 한강 때문에 민간인 피난이 어려웠던 기억과 경제발전으로 인한 서울로의 지속적인 인구 유입 때문입니다.",
     "page": 2,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
   },
   {
     "id": 3,
@@ -21,7 +23,8 @@
     "paraphrase": "옛날 중국 책에서는 한강을 뭐라고 적었어?",
     "answer": "'대수(帶水)'라고 표기했습니다.",
     "page": 5,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
   },
   {
     "id": 4,
@@ -29,7 +32,8 @@
     "paraphrase": "고구려랑 백제는 한강을 뭐라고 불렀어?",
     "answer": "고구려는 '아리수(阿利水)', 백제는 '욱리하(郁利河)'라고 불렀습니다.",
     "page": 5,
-    "note": "페이지 경계: '욱 / 리하郁利河'가 5~6쪽에 걸쳐 있음"
+    "note": "페이지 경계: '욱 / 리하郁利河'가 5~6쪽에 걸쳐 있음",
+    "answerable": true
   },
   {
     "id": 5,
@@ -37,7 +41,8 @@
     "paraphrase": "옛날에 동작동 근처 한강은 뭐라고 불렸어?",
     "answer": "'동작강' 또는 '동재기강'이라 불렸습니다.",
     "page": 6,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
   },
   {
     "id": 6,
@@ -45,7 +50,8 @@
     "paraphrase": "화천에 있는 호수는 물을 얼마나 담고 있어?",
     "answer": "약 10억 톤 규모입니다.",
     "page": 6,
-    "note": "검수 교체: 소양호 · 충주호(약 30억 톤)와 헷갈리기 쉬운 수치"
+    "note": "검수 교체: 소양호 · 충주호(약 30억 톤)와 헷갈리기 쉬운 수치",
+    "answerable": true
   },
   {
     "id": 7,
@@ -53,7 +59,8 @@
     "paraphrase": "남한강 물은 어디서 처음 시작돼?",
     "answer": "태백산 국립공원 대덕산 검룡소입니다.",
     "page": 7,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
   },
   {
     "id": 8,
@@ -61,7 +68,8 @@
     "paraphrase": "한강은 전체 길이가 얼마나 돼?",
     "answer": "총길이는 514km에 달합니다.",
     "page": 8,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
   },
   {
     "id": 9,
@@ -69,7 +77,8 @@
     "paraphrase": "한강에 다리가 몇 개나 있고, 책에서는 그중 몇 개를 골랐어?",
     "answer": "총 33개이며, 이 책은 그중 8개를 다룹니다.",
     "page": 8,
-    "note": "검수 교체: 두 가지 사실을 함께 묻는 질문"
+    "note": "검수 교체: 두 가지 사실을 함께 묻는 질문",
+    "answerable": true
   },
   {
     "id": 10,
@@ -77,7 +86,8 @@
     "paraphrase": "미리 힘을 가해 둔 콘크리트 공법으로 처음 지은 한강 다리가 뭐야?",
     "answer": "원효대교입니다.",
     "page": 9,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
   },
   {
     "id": 11,
@@ -85,7 +95,8 @@
     "paraphrase": "위아래 두 층으로 된 첫 한강 다리는 어디야?",
     "answer": "반포대교입니다.",
     "page": 10,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
   },
   {
     "id": 12,
@@ -93,7 +104,8 @@
     "paraphrase": "성수대교가 무너진 뒤 새로 생긴 법 이름이 뭐야?",
     "answer": "'시설물 안전관리에 관한 특별법'입니다.",
     "page": 11,
-    "note": "페이지 경계: '시설물 안전관리 / 에 관한 특별법'이 11~12쪽에 걸쳐 있음"
+    "note": "페이지 경계: '시설물 안전관리 / 에 관한 특별법'이 11~12쪽에 걸쳐 있음",
+    "answerable": true
   },
   {
     "id": 13,
@@ -101,7 +113,8 @@
     "paraphrase": "어떤 다리를 장대교량이라고 부르려면 기둥 사이가 얼마나 떨어져 있어야 해?",
     "answer": "200m를 넘어가는 교량입니다.",
     "page": 14,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
   },
   {
     "id": 14,
@@ -109,7 +122,8 @@
     "paraphrase": "양화대교는 처음에 왜 지은 거야?",
     "answer": "군사적 목적으로, 비상시 인천으로 들어오는 군용물자를 신속하게 한강을 건너 서부전선으로 이동시키기 위해 만들어졌습니다.",
     "page": 15,
-    "note": "검수 교체: 이유를 묻는 질문"
+    "note": "검수 교체: 이유를 묻는 질문",
+    "answerable": true
   },
   {
     "id": 15,
@@ -117,7 +131,8 @@
     "paraphrase": "양화대교의 옛날 이름은 뭐였어?",
     "answer": "'제2한강교'입니다.",
     "page": 15,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
   },
   {
     "id": 16,
@@ -125,7 +140,8 @@
     "paraphrase": "정선이 양화나루 일대를 그린 그림 이름이 뭐야?",
     "answer": "〈양화진〉입니다.",
     "page": 16,
-    "note": "정답이 그림 캡션(1-1)에 있음"
+    "note": "정답이 그림 캡션(1-1)에 있음",
+    "answerable": true
   },
   {
     "id": 17,
@@ -133,7 +149,8 @@
     "paraphrase": "잠두봉이라는 이름은 무슨 뜻이야?",
     "answer": "누에가 머리를 든 모습 같다고 하여 잠두봉이라 불렸습니다.",
     "page": 17,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
   },
   {
     "id": 18,
@@ -141,7 +158,8 @@
     "paraphrase": "병인양요 때 프랑스군을 물리친 곳이 어디야?",
     "answer": "강화도 정족산성입니다.",
     "page": 18,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
   },
   {
     "id": 19,
@@ -149,7 +167,8 @@
     "paraphrase": "절두산이라는 이름은 어떻게 생긴 거야?",
     "answer": "천주교 박해 당시 수천 명의 신자들의 머리가 잘려 나가면서 '머리가 잘리는 산'이라는 뜻으로 불리기 시작했습니다.",
     "page": 19,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
   },
   {
     "id": 20,
@@ -157,6 +176,43 @@
     "paraphrase": "양화대교 북쪽 끝에 시민들이 돈을 모아 세운 탑 이름이 뭐야?",
     "answer": "'UN군 자유수호 참전기념탑'입니다.",
     "page": 20,
-    "note": "Gemini 생성 · 검수 완료"
+    "note": "Gemini 생성 · 검수 완료",
+    "answerable": true
+  },
+  {
+    "id": 21,
+    "question": "한강대교는 몇 년에 처음 개통했나요?",
+    "paraphrase": "한강대교는 언제 처음 생겼어?",
+    "answer": "문서에서 찾을 수 없음",
+    "page": 0,
+    "note": "답이 없는 질문: 문서에는 '1900년대 초기 리벳 구조'라는 표현만 있음 (모델은 1917년을 알 수 있음)",
+    "answerable": false
+  },
+  {
+    "id": 22,
+    "question": "양화대교의 총 길이는 몇 미터인가요?",
+    "paraphrase": "양화대교 길이가 얼마나 돼?",
+    "answer": "문서에서 찾을 수 없음",
+    "page": 0,
+    "note": "답이 없는 질문: 1965년 완공만 있고 길이는 없음",
+    "answerable": false
+  },
+  {
+    "id": 23,
+    "question": "올림픽대교 주탑의 높이는 몇 미터인가요?",
+    "paraphrase": "올림픽대교 탑은 얼마나 높아?",
+    "answer": "문서에서 찾을 수 없음",
+    "page": 0,
+    "note": "답이 없는 질문: '케이블을 이용한 첫 다리'까지만 있음",
+    "answerable": false
+  },
+  {
+    "id": 24,
+    "question": "반포대교 달빛무지개분수는 언제 설치되었나요?",
+    "paraphrase": "반포대교 분수쇼는 언제부터 했어?",
+    "answer": "문서에서 찾을 수 없음",
+    "page": 0,
+    "note": "답이 없는 질문: 반포대교는 2층 구조 이야기만 있음",
+    "answerable": false
   }
 ]

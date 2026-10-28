@@ -23,6 +23,7 @@ DEFAULTS = {
     "cfg_top_k": config.TOP_K,
     "cfg_llm_choice": config.LLM_GEMINI,
     "cfg_llm_model": config.LLM_MODEL,
+    "cfg_judge_model": config.JUDGE_MODEL,
     "cfg_max_output_tokens": config.MAX_OUTPUT_TOKENS,
     "cfg_instructions": config.SYSTEM_PROMPT,
 }
@@ -44,6 +45,7 @@ class Settings:
     llm_model: str  # Gemini 모델 ID (Gemini 답변 · 이미지 읽기 · OCR · 채점)
     max_output_tokens: int
     instructions: str
+    judge_model: str  # 평가 화면의 채점 · 근거 충실도 판정 모델
 
     @property
     def chunk_ok(self) -> bool:
@@ -111,6 +113,12 @@ def render_sidebar(page: str = "main") -> Settings:
         )
         st.number_input("출력 토큰 상한", 256, 65536, step=256, key="cfg_max_output_tokens")
         st.text_area("지시문 (시스템 프롬프트)", key="cfg_instructions", height=200)
+        if page == "eval":
+            st.subheader("C. 채점")
+            st.text_input(
+                "채점 모델 (Gemini)", key="cfg_judge_model",
+                help="정답 채점 · 근거 충실도 판정에 사용. 답변 모델과 같으면 자기 답에 후한 편향이 생길 수 있어 다른 모델 권장",
+            )
 
     s = st.session_state
     settings = Settings(
@@ -129,6 +137,7 @@ def render_sidebar(page: str = "main") -> Settings:
         llm_model=s.cfg_llm_model,
         max_output_tokens=s.cfg_max_output_tokens,
         instructions=s.cfg_instructions,
+        judge_model=s.cfg_judge_model,
     )
     if not settings.chunk_ok:
         st.sidebar.error("청크 겹침은 청크 크기보다 작아야 합니다.")

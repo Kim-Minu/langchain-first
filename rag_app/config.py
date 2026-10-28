@@ -68,6 +68,8 @@ CHUNK_ACROSS_PAGES = False
 # 같은 컬렉션 안에서는 차원이 같아야 비교할 수 있으므로, 차원을 바꾸면 다시 인덱싱해야 함
 EMBEDDING_DIMENSION_OPTIONS = [768, 1536, 3072]
 EMBEDDING_DIMENSION = 768
+# 같은 텍스트의 벡터를 PostgreSQL embedding_cache 테이블에 저장해 재사용 (모델 · 차원 · 문서/질문용별)
+EMBEDDING_CACHE = os.getenv("RAG_EMBEDDING_CACHE", "1") != "0"
 # gemini-embedding-2(Vertex AI)는 요청 한 번에 텍스트 하나만 받으므로 청크를 동시에 몇 개씩 요청할지
 EMBEDDING_CONCURRENCY = int(os.getenv("RAG_EMBEDDING_CONCURRENCY", "8"))
 
@@ -96,8 +98,8 @@ EVAL_PDF = EVAL_DATA_DIR / "han-gang_1-20.pdf"
 EVAL_QA_FILE = EVAL_DIR / "han_gang_qa.json"
 EVAL_COLLECTION = "rag_eval_han_gang"
 EVAL_QUESTION_COUNT = 20
-# 질문마다 답변 + 채점 두 번 호출하므로 너무 높이면 할당량(429)에 걸림
-EVAL_CONCURRENCY = int(os.getenv("RAG_EVAL_CONCURRENCY", "2"))
+# 너무 높이면 할당량(429)에 걸림
+EVAL_CONCURRENCY = int(os.getenv("RAG_EVAL_CONCURRENCY", "2"))  # 문항마다 답변 · 채점 · 근거 충실도 3회 호출
 
 # 스캔한 책 페이지 → 인쇄된 텍스트만 (사진 · 그림 · 지도 안의 글자와 그림 설명은 제외)
 OCR_PROMPT = (
@@ -118,11 +120,29 @@ QA_GENERATION_PROMPT = (
     "- 문서 밖 지식이 필요하거나 '이 책' 같은 모호한 지시어가 필요한 질문은 제외\n\n{pages}"
 )
 
+# 채점 모델: 답변 모델과 다른 모델을 써서 자기 답에 후한 편향(self-preference)을 줄임
+# (gemini-4-argon은 이 프로젝트에서 403, Pro 계열 중 호출되는 미리보기 모델을 기본값으로)
+JUDGE_MODEL = os.getenv("RAG_JUDGE_MODEL", "gemini-3.1-pro-preview")
+
+# 답이 없는 질문(문서에 없는 내용)의 정답 표기
+UNANSWERABLE = "문서에서 찾을 수 없음"
+
 # 채점: 문서 기반 정답과 비교해 RAG 답변을 판정 (LLM-as-judge)
 JUDGE_PROMPT = (
     "질문, 정답(문서 기준), 평가할 답변이 주어집니다. 답변이 정답의 핵심 사실을 맞혔는지 판정하세요.\n"
     "- correct: 핵심 사실을 모두 맞힘 (표현이 달라도 됨, 정답에 없는 내용이 더 있어도 틀리지 않았다면 정답)\n"
     "- partial: 핵심 사실 일부만 맞힘\n"
-    "- incorrect: 틀렸거나, 찾을 수 없다고 답했거나, 핵심 사실이 없음\n\n"
-    "질문: {question}\n정답: {gold}\n답변: {answer}"
+    "- incorrect: 틀렸거나, 찾을 수 없다고 답했거나, 핵심 사실이 없음\n"
+    f"정답이 '{UNANSWERABLE}'이면 문서에 답이 없는 질문입니다. 답변이 문서에서 찾을 수 없다고 밝히면 correct, "
+    "구체적인 답(연도 · 수치 · 이름 등)을 제시하면 문서 밖 지식이나 추측이므로 incorrect입니다.\n\n"
+    "질문: {question}\n정답: {gold}\n답변: {answer}"  # f-string이 아닌 조각이라 중괄호 한 번
+)
+
+# 근거 충실도(faithfulness): 답변의 주장이 검색된 문맥에 근거하는지 (정답 데이터 없이도 측정 가능)
+FAITHFULNESS_PROMPT = (
+    "[문서]와 [답변]이 주어집니다. 답변을 사실 주장 단위로 나누고, 각 주장이 [문서]에 의해 뒷받침되는지 판정하세요.\n"
+    "- 문서에 직접 쓰여 있거나 문서 내용만으로 바로 알 수 있으면 supported, 아니면 unsupported\n"
+    "- '문서에서 찾을 수 없다'는 문장, 인사말, 근거 번호([1] 등)는 주장이 아니므로 제외\n"
+    "- 주장이 하나도 없으면 빈 목록\n\n"
+    "[문서]\n{context}\n\n[답변]\n{answer}"
 )

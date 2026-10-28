@@ -25,6 +25,7 @@ from rag_app import pipeline as rag
 from rag_app.config import (
     EVAL_CONCURRENCY,
     EVAL_DATA_DIR,
+    FAITHFULNESS_PROMPT,
     JUDGE_PROMPT,
     QA_GENERATION_PROMPT,
 )
@@ -87,6 +88,8 @@ class QAItem:
     # 같은 질문을 문서 표현을 피해 사용자 말투로 바꾼 것. 생성된 질문은 문서 문장을 그대로 따라 써서
     # 검색이 실제보다 쉬워지므로, 같은 정답으로 이 질문도 평가해 현실적인 난이도를 봄
     paraphrase: str = ""
+    # 문서에 답이 없는 질문 (정답: config.UNANSWERABLE, page 0). 지어내지 않고 모른다고 하는지(거절 정확도) 측정
+    answerable: bool = True
 
 
 def generate_qa(llm: BaseChatModel, pages: list[Document], count: int) -> list[QAItem]:
@@ -117,6 +120,15 @@ class Judgement(BaseModel):
     reason: str = Field(description="판정 이유 한 문장")
 
 
+class ClaimCheck(BaseModel):
+    claim: str = Field(description="답변 속 사실 주장 하나")
+    supported: bool = Field(description="문서에 의해 뒷받침되면 true")
+
+
+class FaithfulnessCheck(BaseModel):
+    claims: list[ClaimCheck]
+
+
 @dataclass
 class EvalResult:
     id: int
@@ -129,12 +141,27 @@ class EvalResult:
     retrieved: list[dict] = field(default_factory=list)  # 순위별 page · page_end · 거리 · chunk_index
     page_hit: bool = False  # 정답 페이지가 검색된 청크 안에 있었는지
     gold_rank: int = 0  # 정답 페이지를 포함한 첫 청크의 순위 (1부터, 못 찾으면 0)
+    answerable: bool = True
+    # 근거 충실도: 답변 주장 중 검색된 문맥에 근거한 비율 (주장이 없으면 None, 예: "찾을 수 없습니다")
+    faithfulness: float | None = None
+    unsupported: list[str] = field(default_factory=list)  # 문맥에 근거가 없는 주장
     latency: float = 0.0  # 답변 생성 시간(초), 검색 · 채점 · 할당량 대기 제외
     tokens: int = 0
 
 
 def judge(llm: BaseChatModel, question: str, gold: str, answer: str) -> Judgement:
     return llm.with_structured_output(Judgement).invoke(JUDGE_PROMPT.format(question=question, gold=gold, answer=answer))
+
+
+def check_faithfulness(llm: BaseChatModel, context: str, answer: str) -> tuple[float | None, list[str]]:
+    """답변을 주장 단위로 나눠 문맥 근거 여부를 판정. 반환: (근거 있는 주장 비율, 근거 없는 주장 목록)."""
+    checked = llm.with_structured_output(FaithfulnessCheck).invoke(
+        FAITHFULNESS_PROMPT.format(context=context, answer=answer)
+    )
+    if not checked.claims:
+        return None, []
+    supported = sum(c.supported for c in checked.claims)
+    return round(supported / len(checked.claims), 3), [c.claim for c in checked.claims if not c.supported]
 
 
 def _covers(doc: Document, page: int) -> bool:
@@ -165,7 +192,7 @@ def evaluate_one(
     use_paraphrase: bool = False,
 ) -> EvalResult:
     question = item.paraphrase if use_paraphrase and item.paraphrase else item.question
-    result = EvalResult(item.id, question, item.answer, item.page)
+    result = EvalResult(item.id, question, item.answer, item.page, answerable=item.answerable)
     try:
         hits = _with_rate_limit_retry(
             lambda: rag.search_chunks(store, rag.embed_question(store.embeddings, question), k)
@@ -191,6 +218,9 @@ def evaluate_one(
         result.page_hit = result.gold_rank > 0
         judgement = _with_rate_limit_retry(lambda: judge(judge_llm, question, item.answer, result.answer))
         result.verdict, result.reason = judgement.verdict, judgement.reason
+        result.faithfulness, result.unsupported = _with_rate_limit_retry(
+            lambda: check_faithfulness(judge_llm, rag.format_context(docs), result.answer)
+        )
     except Exception as e:  # 한 문항의 실패가 전체 평가를 멈추지 않게
         result.verdict, result.reason = "error", f"{type(e).__name__}: {str(e)[:200]}"
     return result
@@ -222,15 +252,23 @@ def evaluate(
 
 
 def summarize(results: list[EvalResult]) -> dict:
-    n = len(results) or 1
-    count = {v: sum(r.verdict == v for r in results) for v in VERDICT_SCORE}
+    """답이 있는 질문으로 점수 · 검색 지표를, 답이 없는 질문으로 거절 정확도를 따로 집계."""
+    answerable = [r for r in results if r.answerable]
+    unanswerable = [r for r in results if not r.answerable]
+    n = len(answerable) or 1
+    faithful = [r.faithfulness for r in results if r.faithfulness is not None]
     return {
         "questions": len(results),
-        "score": round(sum(VERDICT_SCORE[r.verdict] for r in results) / n, 3),  # correct 1 · partial 0.5
-        **count,
-        "page_hit_rate": round(sum(r.page_hit for r in results) / n, 3),
+        "score": round(sum(VERDICT_SCORE[r.verdict] for r in answerable) / n, 3),  # correct 1 · partial 0.5
+        **{v: sum(r.verdict == v for r in answerable) for v in VERDICT_SCORE},
+        "page_hit_rate": round(sum(r.page_hit for r in answerable) / n, 3),
         # 정답 페이지 청크 순위의 역수 평균 (1위면 1, 2위면 0.5, 못 찾으면 0)
-        "mrr": round(sum(1 / r.gold_rank for r in results if r.gold_rank) / n, 3),
-        "avg_latency": round(sum(r.latency for r in results) / n, 2),
-        "avg_tokens": round(sum(r.tokens for r in results) / n),
+        "mrr": round(sum(1 / r.gold_rank for r in answerable if r.gold_rank) / n, 3),
+        # 답이 없는 질문에 "찾을 수 없다"고 답한 비율
+        "refusal_accuracy": round(sum(r.verdict == "correct" for r in unanswerable) / len(unanswerable), 3)
+        if unanswerable else None,
+        "faithfulness": round(sum(faithful) / len(faithful), 3) if faithful else None,
+        "unsupported_answers": sum(bool(r.unsupported) for r in results),
+        "avg_latency": round(sum(r.latency for r in results) / (len(results) or 1), 2),
+        "avg_tokens": round(sum(r.tokens for r in results) / (len(results) or 1)),
     }

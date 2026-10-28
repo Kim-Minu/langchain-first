@@ -73,7 +73,7 @@ def run_index_steps(result: dict, data: bytes, file_name: str, index_info: dict)
         )
     st.write(f"3) 임베딩하기 ({len(result['chunks'])}개 청크)")
     embeddings = get_embeddings(embedding_model, embedding_dim)
-    result["vectors"] = rag.embed_chunks(embeddings, result["chunks"])
+    result["vectors"], result["embedding_cache_hits"] = rag.embed_chunks(embeddings, result["chunks"])
     st.write("4) 벡터 스토어 저장")
     store = get_store(embedding_model, embedding_dim, collection_name)
     result["ids"] = rag.save_to_store(
@@ -240,9 +240,12 @@ with tab_index:
                 "A-3", "임베딩하기",
                 f"청크 → 숫자 배열 · {result['settings']['embedding_model']} (task_type=RETRIEVAL_DOCUMENT)",
             )
-            c1, c2 = st.columns(2)
+            hits = result.get("embedding_cache_hits", 0)
+            c1, c2, c3, c4 = st.columns(4)
             c1.metric("벡터 수", len(vectors))
             c2.metric("차원", len(vectors[0]) if vectors else "-")
+            c3.metric("캐시 사용", hits, help="같은 모델 · 차원 · 텍스트의 벡터를 embedding_cache 테이블에서 재사용")
+            c4.metric("새로 계산 (API 호출)", len(vectors) - hits)
             st.dataframe(
                 pd.DataFrame(
                     [{"chunk": i, **{f"v{j}": round(v, 5) for j, v in enumerate(vec[:8])}, "…": "…",
