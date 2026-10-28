@@ -91,12 +91,19 @@ class GeminiImageReader:
     """
 
     def __init__(
-        self, model: BaseChatModel, prompt: str = IMAGE_PROMPT, attempts: int = 2, mark: str | None = IMAGE_TEXT_MARK,
+        self,
+        model: BaseChatModel,
+        prompt: str = IMAGE_PROMPT,
+        attempts: int = 2,
+        mark: str | None = IMAGE_TEXT_MARK,
+        empty_ok: bool = False,
     ):
         self.model = model
         self.prompt = prompt
         self.attempts = attempts
         self.mark = mark  # OCR처럼 결과가 페이지 본문 자체일 때는 None으로 표시 생략
+        # OCR은 글자 없는 전면 사진 페이지가 있어 빈 응답이 정상일 수 있음 → 재시도 후에도 비면 실패가 아니라 빈 페이지로 인정
+        self.empty_ok = empty_ok
         self.failures: list[str] = []
 
     def describe(self, img, label: str) -> str:
@@ -120,12 +127,12 @@ class GeminiImageReader:
                 return f"{self.mark}\n{text}" if self.mark else text
             # 작은 이미지 · 단색 이미지는 미리 걸렀으므로 빈 응답은 일시적인 현상일 수 있어 재시도,
             # 그래도 비면 조용히 사라지지 않게 기록
-            if attempt == self.attempts:
+            if attempt == self.attempts and not self.empty_ok:
                 self.failures.append(f"{label} · Gemini 빈 응답 (내용 없음으로 판단했거나 일시적 오류)")
         return ""
 
 
-def _extract_page_images(data: bytes, reader: GeminiImageReader) -> list[list[tuple[str, object]]]:
+def extract_page_images(data: bytes, reader: GeminiImageReader) -> list[list[tuple[str, object]]]:
     """페이지별 (라벨, PIL 이미지) 목록. 아이콘 · 로고 같은 작은 이미지는 호출 비용만 들어 건너뜀.
 
     PyPDFLoader의 extract_images는 JPEG · 일부 무손실 형식만 꺼내고 흑백 스캔에 흔한
@@ -162,7 +169,7 @@ def _extract_page_images(data: bytes, reader: GeminiImageReader) -> list[list[tu
 
 def _read_page_images(data: bytes, reader: GeminiImageReader) -> list[str]:
     """페이지별 이미지 설명 텍스트. 모든 이미지를 IMAGE_CONCURRENCY개씩 동시에 Gemini에 요청."""
-    page_images = _extract_page_images(data, reader)
+    page_images = extract_page_images(data, reader)
     jobs = [(page_idx, label, img) for page_idx, images in enumerate(page_images) for label, img in images]
     with ThreadPoolExecutor(max_workers=IMAGE_CONCURRENCY) as pool:
         texts = list(pool.map(lambda job: reader.describe(job[2], job[1]), jobs))

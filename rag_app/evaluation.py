@@ -1,7 +1,7 @@
 """OCR · 질문/정답 생성 · RAG 평가 (pages/ocr_eval.py에서 사용).
 
 검색 · 프롬프트 · 답변 단계는 pipeline.py의 함수를 그대로 쓰고, 여기에는 평가에만 필요한 것을 둔다.
-    ocr_pdf          스캔 PDF → 페이지별 인쇄 텍스트 (Gemini, 사진 · 그림 제외) + 파일 캐시
+    ocr_pdf          스캔 PDF → 페이지별 인쇄 텍스트 (Gemini, 사진 · 그림 제외) + 페이지 단위 캐시
     generate_qa      OCR 본문 → 질문 · 정답 · 근거 페이지 N쌍 (Gemini 구조화 출력)
     evaluate         질문마다 RAG 실행 → 정답 페이지 검색 여부 + Gemini 채점 (correct / partial / incorrect)
     summarize        정답률 · 검색 적중률 · 지연 시간 · 토큰 집계
@@ -26,6 +26,7 @@ from rag_app.config import (
     EVAL_CONCURRENCY,
     EVAL_DATA_DIR,
     FAITHFULNESS_PROMPT,
+    IMAGE_CONCURRENCY,
     JUDGE_PROMPT,
     QA_GENERATION_PROMPT,
 )
@@ -35,32 +36,61 @@ from rag_app.config import (
 # ---------------------------------------------------------------------------
 
 
-def _ocr_cache_path(data: bytes, prompt: str, model: str) -> Path:
-    key = hashlib.sha256(f"{rag.file_sha256(data)}|{model}|{prompt}".encode()).hexdigest()[:16]
-    return EVAL_DATA_DIR / f"ocr_{key}.json"
+OCR_PAGE_CACHE_DIR = EVAL_DATA_DIR / "ocr_pages"
+
+
+def _page_cache_path(images: list[tuple[str, object]], model: str, prompt: str) -> Path:
+    """페이지 이미지 픽셀 + 모델 + 프롬프트로 만든 캐시 파일 경로. 다른 PDF라도 같은 페이지면 같은 키."""
+    digest = hashlib.sha256(f"{model}|{prompt}".encode())
+    for _, img in images:
+        digest.update(hashlib.sha256(img.tobytes()).digest())
+    return OCR_PAGE_CACHE_DIR / f"{digest.hexdigest()[:24]}.txt"
 
 
 def ocr_pdf(
-    data: bytes, file_name: str, llm: BaseChatModel, model: str, prompt: str, use_cache: bool = True,
-) -> tuple[list[Document], list[str], bool]:
-    """스캔 PDF를 페이지마다 Gemini로 받아 적음. 반환: (페이지 Document, 실패 목록, 캐시 사용 여부).
+    data: bytes,
+    file_name: str,
+    llm: BaseChatModel,
+    model: str,
+    prompt: str,
+    use_cache: bool = True,
+    on_page: Callable[[int, int, int, bool], None] | None = None,
+) -> tuple[list[Document], list[str], int]:
+    """스캔 PDF를 페이지마다 Gemini로 받아 적음. 반환: (페이지 Document, 실패 목록, 캐시에서 가져온 페이지 수).
 
-    pipeline.load_pdf + GeminiImageReader를 그대로 쓰되 OCR 프롬프트를 주고 [이미지 설명] 표시는 생략.
-    같은 파일 · 모델 · 프롬프트의 결과는 eval/data/에 저장해 재사용 (실패한 페이지가 있으면 저장하지 않음).
+    - pipeline의 GeminiImageReader · extract_page_images를 그대로 쓰되 OCR 프롬프트를 주고 [이미지 설명] 표시는 생략
+    - 페이지 단위 캐시(eval/data/ocr_pages/): 성공한 페이지는 바로 저장하고, 실패한 페이지만 다음 실행 때 다시 OCR.
+      키가 페이지 이미지 기준이라 1~20쪽과 1~100쪽처럼 같은 페이지를 담은 다른 PDF도 캐시를 공유
+    - 페이지를 IMAGE_CONCURRENCY개씩 동시에 처리, on_page(끝난 수, 전체, 페이지 번호, 캐시 사용)는 호출한 스레드에서 불림
     """
-    cache = _ocr_cache_path(data, prompt, model)
-    if use_cache and cache.exists():
-        saved = json.loads(cache.read_text())
-        return [Document(page_content=p["text"], metadata=p["metadata"]) for p in saved], [], True
+    pages = rag.load_pdf(data, file_name)  # 텍스트 레이어 (스캔 PDF는 빈 문자열) + 페이지 metadata
+    reader = rag.GeminiImageReader(llm, prompt, mark=None, empty_ok=True)
+    page_images = rag.extract_page_images(data, reader)
 
-    reader = rag.GeminiImageReader(llm, prompt, mark=None)
-    pages = rag.load_pdf(data, file_name, reader)
-    if not reader.failures:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(
-            json.dumps([{"text": p.page_content, "metadata": p.metadata} for p in pages], ensure_ascii=False, indent=1)
-        )
-    return pages, reader.failures, False
+    def read_page(index: int) -> tuple[int, str, bool]:
+        images = page_images[index]
+        if not images:
+            return index, "", False
+        cache = _page_cache_path(images, model, prompt)
+        if use_cache and cache.exists():
+            return index, cache.read_text(), True
+        before = len(reader.failures)
+        text = "\n\n".join(t for label, img in images if (t := reader.describe(img, label)))
+        if len(reader.failures) == before:  # 이 페이지에서 실패가 없을 때만 저장
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(text)
+        return index, text, False
+
+    cached = 0
+    with ThreadPoolExecutor(max_workers=IMAGE_CONCURRENCY) as pool:
+        futures = [pool.submit(read_page, i) for i in range(len(pages))]
+        for done, future in enumerate(as_completed(futures), start=1):
+            index, text, from_cache = future.result()
+            cached += from_cache
+            pages[index].page_content = f"{pages[index].page_content.strip()}\n\n{text}".strip()
+            if on_page:
+                on_page(done, len(pages), index + 1, from_cache)
+    return pages, reader.failures, cached
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 """RAG 실습의 기본 설정값. 화면 사이드바에서 바꿀 수 있는 값은 범위(min/max)도 함께 둔다."""
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 # Vertex AI (chat_app과 같은 ADC 인증 · 프로젝트 사용)
@@ -94,9 +95,27 @@ SYSTEM_PROMPT = (
 EVAL_DIR = Path(__file__).resolve().parent / "eval"
 # 원본 PDF · OCR 캐시는 저작물이라 git에서 제외한 data/ 폴더에 둠
 EVAL_DATA_DIR = EVAL_DIR / "data"
-EVAL_PDF = EVAL_DATA_DIR / "han-gang_1-20.pdf"
-EVAL_QA_FILE = EVAL_DIR / "han_gang_qa.json"
-EVAL_COLLECTION = "rag_eval_han_gang"
+
+
+@dataclass(frozen=True)
+class EvalDoc:
+    label: str
+    pdf: Path  # 평가할 스캔 PDF (git 제외 폴더)
+    qa_file: Path  # 질문 · 정답 세트 (git에 포함)
+    collection: str  # pgvector 컬렉션
+
+
+# 평가 문서 목록: 화면에서 고르면 PDF · 질문 세트 · 컬렉션이 함께 바뀜
+EVAL_DOCS = {
+    "han-gang-20": EvalDoc(
+        "한강 다리 1~20쪽", EVAL_DATA_DIR / "han-gang_1-20.pdf", EVAL_DIR / "han_gang_qa.json", "rag_eval_han_gang",
+    ),
+    "han-gang-100": EvalDoc(
+        "한강 다리 1~100쪽", EVAL_DATA_DIR / "han-gang_1-100.pdf", EVAL_DIR / "han_gang_100_qa.json",
+        "rag_eval_han_gang_100",
+    ),
+}
+EVAL_DOC = "han-gang-20"
 EVAL_QUESTION_COUNT = 20
 # 너무 높이면 할당량(429)에 걸림
 EVAL_CONCURRENCY = int(os.getenv("RAG_EVAL_CONCURRENCY", "2"))  # 문항마다 답변 · 채점 · 근거 충실도 3회 호출
