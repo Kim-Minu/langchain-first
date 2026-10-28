@@ -8,7 +8,8 @@ B. 질문에 답하기 (런타임): 질문 입력 → 관련 청크 검색 → �
 - 문서: PDF만 허용 (업로드 확장자 + 파일 헤더 %PDF- 검사)
 - 임베딩 · LLM: Google Gemini (Vertex AI, ADC 인증)
 - 벡터 스토어: docker-compose.yml의 PostgreSQL + pgvector (langchain-postgres PGVector)
-- 청크 크기 · 겹침 · top-k · 임베딩 차원 · 지시문 등은 왼쪽 사이드바에서 변경
+- 청크 크기 · 겹침 · top-k · 임베딩 차원 · 지시문 등은 왼쪽 사이드바에서 변경 (ui_common.py, 평가 화면과 공유)
+- 평가 화면: pages/ocr_eval.py (스캔 PDF OCR → 질문 · 정답 세트로 RAG 정답률 측정)
 
 실행 방법:
     docker compose up -d                     # PostgreSQL(pgvector) 실행
@@ -27,106 +28,28 @@ import streamlit as st
 
 from rag_app import config
 from rag_app import pipeline as rag
+from rag_app.ui_common import (
+    get_answer_llm,
+    get_embeddings,
+    get_llm,
+    get_store,
+    preview,
+    render_sidebar,
+    show_error,
+    step_header,
+)
 
 st.set_page_config(page_title="PDF RAG 실습", page_icon="📄", layout="wide")
 
 
-# ---------------------------------------------------------------------------
-# 사이드바: 사용자가 바꿀 수 있는 설정값
-# ---------------------------------------------------------------------------
-with st.sidebar:
-    st.header("설정")
-
-    st.subheader("A. 인덱싱")
-    image_mode = st.radio(
-        "PDF 속 이미지", list(config.IMAGE_OPTIONS), format_func=config.IMAGE_OPTIONS.get,
-        index=list(config.IMAGE_OPTIONS).index(config.IMAGE_MODE),
-        help="스캔 PDF는 페이지 전체가 이미지라 끄면 텍스트가 0자. 켜면 이미지마다 Gemini(아래 B의 Gemini 모델 ID)를 한 번씩 호출",
-    )
-    image_prompt = None
-    if image_mode == config.IMAGE_GEMINI:
-        # 비우면 기본 프롬프트 사용 (빈 지시로 호출하면 결과가 들쭉날쭉해짐)
-        image_prompt = st.text_area(
-            "이미지 읽기 프롬프트", config.IMAGE_PROMPT, height=200,
-            help="이미지마다 Gemini에 이 지시와 함께 보냄. 바꾸면 다시 인덱싱해야 반영됨",
-        ).strip() or config.IMAGE_PROMPT
-    chunk_size = st.number_input(
-        "청크 크기 (글자)", config.CHUNK_SIZE_MIN, config.CHUNK_SIZE_MAX, config.CHUNK_SIZE, step=100,
-        help="청크 하나의 최대 글자 수. 작을수록 검색이 정밀하지만 문맥이 끊기기 쉬움",
-    )
-    chunk_overlap = st.number_input(
-        "청크 겹침 (글자)", config.CHUNK_OVERLAP_MIN, config.CHUNK_OVERLAP_MAX, config.CHUNK_OVERLAP, step=50,
-        help="이웃한 청크가 공유하는 글자 수. 경계에서 문장이 잘려도 앞뒤 문맥을 보존",
-    )
-    embedding_model = st.text_input("임베딩 모델 (Gemini)", config.EMBEDDING_MODEL)
-    embedding_dim = st.selectbox(
-        "임베딩 차원", config.EMBEDDING_DIMENSION_OPTIONS,
-        index=config.EMBEDDING_DIMENSION_OPTIONS.index(config.EMBEDDING_DIMENSION),
-        help="바꾸면 다시 인덱싱해야 함 (같은 컬렉션 안의 벡터는 차원이 같아야 비교 가능)",
-    )
-    collection_name = st.text_input("컬렉션 이름 (pgvector)", config.COLLECTION_NAME)
-
-    st.subheader("B. 질문 · 답변")
-    top_k = st.slider("검색할 청크 수 (top-k)", config.TOP_K_MIN, config.TOP_K_MAX, config.TOP_K)
-    llm_choice = st.radio(
-        "답변 모델", list(config.LLM_OPTIONS), format_func=config.LLM_OPTIONS.get, captions=config.LLM_CAPTIONS,
-    )
-    llm_model = st.text_input(
-        "Gemini 모델 ID", config.LLM_MODEL,
-        help="Gemini 답변과 PDF 속 이미지 읽기에 사용 (Gemma를 골라도 이미지 읽기는 Gemini)",
-    )
-    max_output_tokens = st.number_input("출력 토큰 상한", 256, 65536, config.MAX_OUTPUT_TOKENS, step=256)
-    instructions = st.text_area("지시문 (시스템 프롬프트)", config.SYSTEM_PROMPT, height=200)
-
-chunk_settings_ok = chunk_overlap < chunk_size
-if not chunk_settings_ok:
-    st.sidebar.error("청크 겹침은 청크 크기보다 작아야 합니다.")
-
-
-@st.cache_resource(show_spinner=False)
-def get_embeddings(model: str, dimension: int):
-    return rag.create_embeddings(model, dimension)
-
-
-@st.cache_resource(show_spinner=False)
-def get_store(model: str, dimension: int, collection: str):
-    return rag.get_vector_store(get_embeddings(model, dimension), collection)
-
-
-@st.cache_resource(show_spinner=False)
-def get_llm(model: str, max_tokens: int):
-    return rag.create_llm(model, max_tokens)
-
-
-@st.cache_resource(show_spinner=False)
-def get_answer_llm(choice: str, gemini_model: str, max_tokens: int):
-    if choice == config.LLM_OLLAMA_GEMMA:
-        return rag.create_ollama_llm(config.OLLAMA_MODEL, max_tokens)
-    return get_llm(gemini_model, max_tokens)
-
-
-answer_model = config.OLLAMA_MODEL if llm_choice == config.LLM_OLLAMA_GEMMA else llm_model
-
-
-def step_header(label: str, title: str, caption: str) -> None:
-    st.markdown(f"#### {label}. {title}")
-    st.caption(caption)
-
-
-def show_error(step: str, error: Exception) -> None:
-    hint = ""
-    message = str(error)
-    if "Reauthentication" in message or "DefaultCredentialsError" in type(error).__name__:
-        hint = "\n\n터미널에서 `gcloud auth application-default login`으로 Vertex AI 인증을 갱신하세요."
-    elif "connection" in message.lower() and "5433" in message:
-        hint = "\n\n`docker compose up -d`로 PostgreSQL(pgvector)을 먼저 실행하세요."
-    elif 'type "vector" does not exist' in message or "extension" in message and "vector" in message:
-        hint = "\n\n도커 이미지가 pgvector를 포함하는지 확인하세요 (`pgvector/pgvector:pg17`)."
-    elif "langchain_ollama" in message:
-        hint = "\n\n`uv add langchain-ollama`로 패키지를 설치하세요."
-    elif "11434" in message or "ollama" in message.lower():
-        hint = f"\n\n`ollama serve`로 Ollama를 실행하고 `ollama pull {config.OLLAMA_MODEL}`로 모델을 받아 두세요."
-    st.error(f"{step} 실패: {error}{hint}")
+settings = render_sidebar()
+# 아래 코드가 쓰는 이름으로 풀어 둠
+image_mode, image_prompt = settings.image_mode, settings.image_prompt
+chunk_size, chunk_overlap, across_pages = settings.chunk_size, settings.chunk_overlap, settings.across_pages
+embedding_model, embedding_dim, collection_name = settings.embedding_model, settings.embedding_dim, settings.collection
+top_k, llm_choice, llm_model = settings.top_k, settings.llm_choice, settings.llm_model
+max_output_tokens, instructions = settings.max_output_tokens, settings.instructions
+chunk_settings_ok, answer_model = settings.chunk_ok, settings.answer_model
 
 
 def run_index_steps(result: dict, data: bytes, file_name: str, index_info: dict) -> None:
@@ -141,7 +64,7 @@ def run_index_steps(result: dict, data: bytes, file_name: str, index_info: dict)
     result["pages"] = rag.load_pdf(data, file_name, image_reader)
     result["image_failures"] = image_reader.failures if image_reader else []
     st.write("2) 청크로 나누기")
-    result["chunks"] = rag.split_documents(result["pages"], chunk_size, chunk_overlap)
+    result["chunks"] = rag.split_documents(result["pages"], chunk_size, chunk_overlap, across_pages)
     if not result["chunks"]:
         raise ValueError(
             "추출된 텍스트가 없습니다. 이미지 안의 글자도 찾지 못했습니다."
@@ -150,18 +73,13 @@ def run_index_steps(result: dict, data: bytes, file_name: str, index_info: dict)
         )
     st.write(f"3) 임베딩하기 ({len(result['chunks'])}개 청크)")
     embeddings = get_embeddings(embedding_model, embedding_dim)
-    result["vectors"] = rag.embed_chunks(embeddings, result["chunks"])
+    result["vectors"], result["embedding_cache_hits"] = rag.embed_chunks(embeddings, result["chunks"])
     st.write("4) 벡터 스토어 저장")
     store = get_store(embedding_model, embedding_dim, collection_name)
     result["ids"] = rag.save_to_store(
         store, result["chunks"], result["vectors"],
         {**index_info, "image_failures": len(result["image_failures"])},
     )
-
-
-def preview(text: str, length: int = 120) -> str:
-    text = " ".join(text.split())
-    return text if len(text) <= length else text[:length] + " …"
 
 
 st.title("📄 PDF RAG 실습")
@@ -186,6 +104,7 @@ with tab_index:
         "image_model": llm_model if image_mode == config.IMAGE_GEMINI else None,
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
+        "across_pages": across_pages,
         "embedding_model": embedding_model,
         "embedding_dim": embedding_dim,
     }
@@ -321,9 +240,12 @@ with tab_index:
                 "A-3", "임베딩하기",
                 f"청크 → 숫자 배열 · {result['settings']['embedding_model']} (task_type=RETRIEVAL_DOCUMENT)",
             )
-            c1, c2 = st.columns(2)
+            hits = result.get("embedding_cache_hits", 0)
+            c1, c2, c3, c4 = st.columns(4)
             c1.metric("벡터 수", len(vectors))
             c2.metric("차원", len(vectors[0]) if vectors else "-")
+            c3.metric("캐시 사용", hits, help="같은 모델 · 차원 · 텍스트의 벡터를 embedding_cache 테이블에서 재사용")
+            c4.metric("새로 계산 (API 호출)", len(vectors) - hits)
             st.dataframe(
                 pd.DataFrame(
                     [{"chunk": i, **{f"v{j}": round(v, 5) for j, v in enumerate(vec[:8])}, "…": "…",

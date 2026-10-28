@@ -16,6 +16,7 @@ build_rag_chain은 B의 1~4를 LCEL 체인 하나로 연결한 것 (찾는 일�
 """
 
 import base64
+import bisect
 import hashlib
 import io
 import json
@@ -30,6 +31,7 @@ import psycopg
 import pypdf
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
@@ -42,6 +44,7 @@ from psycopg.types.json import Jsonb
 
 from rag_app.config import (
     DATABASE_URL,
+    EMBEDDING_CACHE,
     EMBEDDING_CONCURRENCY,
     EMBEDDING_LOCATION,
     GOOGLE_CLOUD_PROJECT,
@@ -87,10 +90,13 @@ class GeminiImageReader:
       (인덱싱마다 새로 만들어 써야 failures가 섞이지 않음)
     """
 
-    def __init__(self, model: BaseChatModel, prompt: str = IMAGE_PROMPT, attempts: int = 2):
+    def __init__(
+        self, model: BaseChatModel, prompt: str = IMAGE_PROMPT, attempts: int = 2, mark: str | None = IMAGE_TEXT_MARK,
+    ):
         self.model = model
         self.prompt = prompt
         self.attempts = attempts
+        self.mark = mark  # OCR처럼 결과가 페이지 본문 자체일 때는 None으로 표시 생략
         self.failures: list[str] = []
 
     def describe(self, img, label: str) -> str:
@@ -111,7 +117,7 @@ class GeminiImageReader:
                     self.failures.append(f"{label} · {type(e).__name__}: {str(e)[:200]}")
                 continue
             if text:
-                return f"{IMAGE_TEXT_MARK}\n{text}"
+                return f"{self.mark}\n{text}" if self.mark else text
             # 작은 이미지 · 단색 이미지는 미리 걸렀으므로 빈 응답은 일시적인 현상일 수 있어 재시도,
             # 그래도 비면 조용히 사라지지 않게 기록
             if attempt == self.attempts:
@@ -196,22 +202,138 @@ def load_pdf(data: bytes, file_name: str, image_reader: GeminiImageReader | None
     return pages
 
 
-def split_documents(pages: list[Document], chunk_size: int, chunk_overlap: int) -> list[Document]:
-    """2) 청크로 나누기: 문단 → 줄 → 문장 → 단어 순으로 끊어 chunk_size 글자 이하 조각으로."""
+SENTENCE_ENDINGS = (".", "?", "!", "”", '"', "’", "'", "」", ")", ">", "〉")
+
+
+def _join_pages(pages: list[Document]) -> tuple[str, list[int]]:
+    """페이지들을 한 문자열로 이어 붙이고 각 페이지가 시작하는 글자 위치를 함께 반환.
+
+    앞 페이지가 문장 끝으로 끝나면 빈 줄로, 아니면(문장이 다음 페이지로 이어짐) 그대로 붙임.
+    예: 5쪽 끝 '백제는 ‘욱' + 6쪽 시작 '리하郁利河’' → '욱리하郁利河’'
+    """
+    text, starts = "", []
+    for page in pages:
+        body = page.page_content.strip()
+        if text and body:
+            text += "\n\n" if text.endswith(SENTENCE_ENDINGS) else ""
+        starts.append(len(text))
+        text += body
+    return text, starts
+
+
+def split_documents(
+    pages: list[Document], chunk_size: int, chunk_overlap: int, across_pages: bool = False,
+) -> list[Document]:
+    """2) 청크로 나누기: 문단 → 줄 → 문장 → 단어 순으로 끊어 chunk_size 글자 이하 조각으로.
+
+    across_pages=True면 페이지를 이어 붙인 뒤 나눠, 페이지 경계에서 끊긴 문장도 한 청크에 들어가게 함.
+    이때 청크가 걸친 페이지 범위를 page ~ page_end로 기록.
+    """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         add_start_index=True,  # 페이지 안에서 청크가 시작하는 글자 위치 (출처 표시용)
     )
-    chunks = splitter.split_documents(pages)
+    if not across_pages:
+        chunks = splitter.split_documents(pages)
+    else:
+        text, starts = _join_pages(pages)
+        chunks = splitter.create_documents([text]) if text else []
+        for chunk in chunks:
+            begin = chunk.metadata["start_index"]
+            first = bisect.bisect_right(starts, begin) - 1
+            last = bisect.bisect_right(starts, begin + len(chunk.page_content) - 1) - 1
+            chunk.metadata = {
+                **pages[first].metadata,
+                "page_end": pages[last].metadata["page"],
+                "start_index": begin - starts[first],
+            }
     for i, chunk in enumerate(chunks):
         chunk.metadata["chunk_index"] = i
     return chunks
 
 
-def create_embeddings(model: str, dimension: int) -> GoogleGenerativeAIEmbeddings:
+EMBEDDING_CACHE_DDL = """
+    CREATE TABLE IF NOT EXISTS embedding_cache (
+        model       TEXT NOT NULL,
+        dimension   INT NOT NULL,
+        task_type   TEXT NOT NULL,
+        text_sha256 TEXT NOT NULL,
+        embedding   REAL[] NOT NULL,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (model, dimension, task_type, text_sha256)
+    )
+"""
+DOCUMENT_TASK, QUERY_TASK = "RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY"
+
+
+class CachedEmbeddings(Embeddings):
+    """Gemini 임베딩 앞에 PostgreSQL 캐시(embedding_cache 테이블)를 둔 래퍼.
+
+    - 키: 모델 + 차원 + task_type + 텍스트 sha256. gemini-embedding-2는 문서용(RETRIEVAL_DOCUMENT)과
+      질문용(RETRIEVAL_QUERY) 벡터가 다르고 차원별로도 다르므로 모두 키에 넣음
+    - 여러 텍스트는 한 번의 쿼리로 조회하고, 없는 것만 Gemini에 요청한 뒤 저장
+    - gemini-embedding-2는 배치 요청("only supports one content at a time")을 거부하므로
+      캐시에 없는 텍스트는 하나씩, 순서를 유지한 채 EMBEDDING_CONCURRENCY개씩 동시에 요청
+    - 같은 DB를 쓰므로 두 화면 · 평가 스크립트가 캐시를 공유하고 앱을 재시작해도 남음
+    """
+
+    def __init__(self, inner: Embeddings, model: str, dimension: int, enabled: bool = True):
+        self.inner = inner
+        self.model = model
+        self.dimension = dimension
+        self.enabled = enabled
+        if enabled:
+            with psycopg.connect(DATABASE_URL) as conn:
+                conn.execute(EMBEDDING_CACHE_DDL)
+
+    def _lookup(self, task: str, hashes: list[str]) -> dict[str, list[float]]:
+        with psycopg.connect(DATABASE_URL) as conn:
+            rows = conn.execute(
+                "SELECT text_sha256, embedding FROM embedding_cache"
+                " WHERE model = %s AND dimension = %s AND task_type = %s AND text_sha256 = ANY(%s)",
+                (self.model, self.dimension, task, hashes),
+            ).fetchall()
+        return dict(rows)
+
+    def _save(self, task: str, items: list[tuple[str, list[float]]]) -> None:
+        with psycopg.connect(DATABASE_URL) as conn, conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO embedding_cache (model, dimension, task_type, text_sha256, embedding)"
+                " VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                [(self.model, self.dimension, task, h, vector) for h, vector in items],
+            )
+
+    def embed_documents_with_stats(self, texts: list[str]) -> tuple[list[list[float]], int]:
+        """문서용 벡터와 캐시에서 가져온 개수."""
+        hashes = [hashlib.sha256(text.encode()).hexdigest() for text in texts]
+        cached = self._lookup(DOCUMENT_TASK, list(set(hashes))) if self.enabled and texts else {}
+        missing = list({h: text for h, text in zip(hashes, texts, strict=True) if h not in cached}.items())
+        with ThreadPoolExecutor(max_workers=EMBEDDING_CONCURRENCY) as pool:
+            fresh = list(pool.map(lambda item: self.inner.embed_documents([item[1]])[0], missing))
+        computed = {h: vector for (h, _), vector in zip(missing, fresh, strict=True)}
+        if self.enabled and computed:
+            self._save(DOCUMENT_TASK, list(computed.items()))
+        hits = sum(h in cached for h in hashes)
+        return [cached.get(h) or computed[h] for h in hashes], hits
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self.embed_documents_with_stats(texts)[0]
+
+    def embed_query(self, text: str) -> list[float]:
+        if not self.enabled:
+            return self.inner.embed_query(text)
+        h = hashlib.sha256(text.encode()).hexdigest()
+        if cached := self._lookup(QUERY_TASK, [h]).get(h):
+            return cached
+        vector = self.inner.embed_query(text)
+        self._save(QUERY_TASK, [(h, vector)])
+        return vector
+
+
+def create_embeddings(model: str, dimension: int) -> CachedEmbeddings:
     credentials, project = _vertex_credentials()
-    return GoogleGenerativeAIEmbeddings(
+    gemini = GoogleGenerativeAIEmbeddings(
         model=model,
         vertexai=True,
         credentials=credentials,
@@ -219,20 +341,21 @@ def create_embeddings(model: str, dimension: int) -> GoogleGenerativeAIEmbedding
         location=EMBEDDING_LOCATION,
         output_dimensionality=dimension,
     )
+    return CachedEmbeddings(gemini, model, dimension, enabled=EMBEDDING_CACHE)
 
 
-def embed_chunks(embeddings: GoogleGenerativeAIEmbeddings, chunks: list[Document]) -> list[list[float]]:
-    """3) 임베딩하기: 청크 텍스트 → 벡터 (embed_documents는 문서용 task_type으로 요청).
+def embed_chunks(embeddings: Embeddings, chunks: list[Document]) -> tuple[list[list[float]], int]:
+    """3) 임베딩하기: 청크 텍스트 → 벡터 (문서용 task_type). 반환: (벡터, 캐시에서 가져온 개수).
 
-    gemini-embedding-2는 배치 요청("only supports one content at a time")을 거부하므로
-    청크마다 따로 요청하고, 순서는 유지한 채 EMBEDDING_CONCURRENCY개씩 동시에 보낸다.
+    CachedEmbeddings면 같은 텍스트의 벡터를 캐시에서 재사용하고 나머지만 Gemini에 요청.
     """
     texts = [chunk.page_content for chunk in chunks]
-    with ThreadPoolExecutor(max_workers=EMBEDDING_CONCURRENCY) as pool:
-        return list(pool.map(lambda text: embeddings.embed_documents([text])[0], texts))
+    if isinstance(embeddings, CachedEmbeddings):
+        return embeddings.embed_documents_with_stats(texts)
+    return embeddings.embed_documents(texts), 0
 
 
-def get_vector_store(embeddings: GoogleGenerativeAIEmbeddings, collection_name: str) -> PGVector:
+def get_vector_store(embeddings: Embeddings, collection_name: str) -> PGVector:
     """PostgreSQL(pgvector) 벡터 스토어. 처음 연결할 때 vector 확장과 테이블을 만든다."""
     return PGVector(
         embeddings=embeddings,
@@ -349,7 +472,7 @@ def inspect_collection(collection_name: str, limit: int = 5) -> tuple[int, list[
 # ---------------------------------------------------------------------------
 
 
-def embed_question(embeddings: GoogleGenerativeAIEmbeddings, question: str) -> list[float]:
+def embed_question(embeddings: Embeddings, question: str) -> list[float]:
     """1) 질문 입력: 질문도 같은 모델로 임베딩 (embed_query는 질문용 task_type으로 요청)."""
     return embeddings.embed_query(question)
 
@@ -359,10 +482,16 @@ def search_chunks(store: PGVector, question_vector: list[float], k: int) -> list
     return store.similarity_search_with_score_by_vector(question_vector, k=k)
 
 
+def page_label(doc: Document) -> str:
+    """'5' 또는 페이지를 넘어 나눈 청크면 '5~6'."""
+    page, page_end = doc.metadata.get("page", "?"), doc.metadata.get("page_end")
+    return f"{page}~{page_end}" if page_end and page_end != page else str(page)
+
+
 def format_context(docs: list[Document]) -> str:
     """검색된 청크를 번호 · 출처와 함께 프롬프트에 넣을 문자열로."""
     return "\n\n".join(
-        f"[{i}] ({doc.metadata.get('source', '?')} p.{doc.metadata.get('page', '?')})\n{doc.page_content}"
+        f"[{i}] ({doc.metadata.get('source', '?')} p.{page_label(doc)})\n{doc.page_content}"
         for i, doc in enumerate(docs, start=1)
     )
 
