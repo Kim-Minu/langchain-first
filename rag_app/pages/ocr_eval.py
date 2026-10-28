@@ -7,7 +7,7 @@
 4. 실행 비교: 설정을 바꿔 가며 실행한 결과를 나란히 비교
 
 사이드바 설정 · 모델 · 벡터 스토어 · 단계 함수는 PDF RAG 실습 화면(app.py)과 공유한다.
-실행: uv run streamlit run rag_app/app.py → 왼쪽 메뉴의 ocr eval
+실행: uv run streamlit run rag_app/app.py → 사이드바 맨 위 "🔎 OCR · RAG 평가" 링크
 """
 
 import io
@@ -37,6 +37,8 @@ from rag_app.ui_common import (
 
 st.set_page_config(page_title="OCR · RAG 평가", page_icon="🔎", layout="wide")
 settings = render_sidebar("eval")
+doc = config.EVAL_DOCS[settings.eval_doc]
+QA_KEY = f"eval_qa_{settings.eval_doc}"  # 문서마다 질문 세트를 따로 보관
 
 VERDICT_MARK = {"correct": "✅ 정답", "partial": "🟡 부분", "incorrect": "❌ 오답", "error": "⚠️ 오류"}
 
@@ -50,7 +52,7 @@ def page_image(data: bytes, page_no: int):
 
 def run_label(question_set: str) -> str:
     return (
-        f"{settings.chunk_size}/{settings.chunk_overlap}"
+        f"{doc.label} · 컬렉션 {settings.collection} · {settings.chunk_size}/{settings.chunk_overlap}"
         f"{' 페이지연결' if settings.across_pages else ''} · k={settings.top_k} · 답변 {settings.answer_model}"
         f" · 채점 {settings.judge_model} · {question_set}"
     )
@@ -59,7 +61,7 @@ def run_label(question_set: str) -> str:
 st.title("🔎 OCR · RAG 평가")
 st.caption(
     "스캔 PDF를 Gemini OCR로 읽어 인덱싱하고, 질문 · 정답 세트로 RAG 답변이 잘 나오는지 측정합니다. "
-    f"OCR · 채점 `{settings.llm_model}` · 답변 `{settings.answer_model}` · 컬렉션 `{settings.collection}`"
+    f"{doc.label} · OCR `{settings.llm_model}` · 답변 `{settings.answer_model}` · 채점 `{settings.judge_model}` · 컬렉션 `{settings.collection}`"
 )
 
 tab_ocr, tab_qa, tab_eval, tab_compare = st.tabs(["1. OCR · 인덱싱", "2. 질문 · 정답", "3. RAG 평가", "4. 실행 비교"])
@@ -71,29 +73,36 @@ with tab_ocr:
     uploaded = st.file_uploader("PDF 파일 (비우면 기본 평가 문서 사용)", type=["pdf"])
     if uploaded is not None:
         pdf_name, pdf_data = uploaded.name, uploaded.getvalue()
-    elif config.EVAL_PDF.exists():
-        pdf_name, pdf_data = config.EVAL_PDF.name, config.EVAL_PDF.read_bytes()
-        st.caption(f"기본 평가 문서: `{config.EVAL_PDF.relative_to(config.EVAL_DIR.parent.parent)}`")
+    elif doc.pdf.exists():
+        pdf_name, pdf_data = doc.pdf.name, doc.pdf.read_bytes()
+        st.caption(f"평가 문서: {doc.label} · `{doc.pdf.relative_to(config.EVAL_DIR.parent.parent)}`")
     else:
         pdf_name, pdf_data = None, None
-        st.warning(f"기본 평가 문서가 없습니다. `{config.EVAL_PDF}`에 PDF를 두거나 업로드하세요.")
+        st.warning(f"평가 문서가 없습니다. `{doc.pdf}`에 PDF를 두거나 업로드하세요.")
 
     left, right = st.columns(2)
-    refresh_ocr = left.checkbox("캐시 무시하고 다시 OCR", help="같은 파일 · 모델 · 프롬프트의 OCR 결과는 eval/data/에 저장해 재사용")
+    refresh_ocr = left.checkbox(
+        "캐시 무시하고 다시 OCR", help="OCR 결과는 페이지 이미지 · 모델 · 프롬프트별로 eval/data/ocr_pages/에 저장해 재사용 (다른 PDF의 같은 페이지도 공유)",
+    )
     if left.button("OCR 실행", type="primary", disabled=pdf_data is None):
         with st.status("OCR 중… (페이지가 많으면 몇 분 걸림)", expanded=True) as status:
             try:
                 if not pdf_data.startswith(rag.PDF_MAGIC):
                     raise ValueError("PDF 파일만 사용할 수 있습니다.")
+                progress = st.progress(0.0, text="페이지 이미지 준비 중…")
                 pages, failures, cached = ev.ocr_pdf(
                     pdf_data, pdf_name, get_llm(settings.llm_model, config.IMAGE_MAX_OUTPUT_TOKENS),
                     settings.llm_model, settings.ocr_prompt, use_cache=not refresh_ocr,
+                    on_page=lambda done, total, page, from_cache: progress.progress(
+                        done / total, text=f"{done}/{total}쪽 · {page}쪽 {'캐시' if from_cache else 'OCR 완료'}"
+                    ),
                 )
+                progress.empty()
                 st.session_state["eval_ocr"] = {
                     "file_name": pdf_name, "sha": rag.file_sha256(pdf_data), "prompt": settings.ocr_prompt,
                     "pages": pages, "failures": failures, "cached": cached,
                 }
-                status.update(label="OCR 완료" + (" (캐시 사용)" if cached else ""), state="complete", expanded=False)
+                status.update(label=f"OCR 완료 (캐시 {cached}쪽 · 새로 OCR {len(pages) - cached}쪽)", state="complete", expanded=False)
             except Exception as e:
                 status.update(label="OCR 실패", state="error")
                 show_error("OCR", e)
@@ -109,9 +118,10 @@ with tab_ocr:
         c1.metric("페이지", len(pages))
         c2.metric("총 글자 수", f"{sum(len(p.page_content) for p in pages):,}")
         c3.metric("실패한 페이지", len(ocr["failures"]))
-        c4.metric("캐시", "사용" if ocr["cached"] else "새로 실행")
+        c4.metric("캐시에서 가져온 쪽", f"{ocr['cached']} / {len(pages)}", help="페이지 이미지 단위 캐시 (eval/data/ocr_pages/)")
         if ocr["failures"]:
-            st.warning("OCR 실패 (캐시에 저장하지 않음, 다시 실행하세요):\n\n" + "\n".join(f"- {f}" for f in ocr["failures"]))
+            st.warning("OCR에 실패한 페이지는 캐시에 저장하지 않았습니다. 다시 실행하면 그 페이지만 이어서 OCR 합니다:\n\n"
+                       + "\n".join(f"- {f}" for f in ocr["failures"]))
         st.dataframe(
             pd.DataFrame(
                 [{"page": p.metadata["page"], "글자 수": len(p.page_content), "미리보기": preview(p.page_content)} for p in pages]
@@ -180,16 +190,17 @@ with tab_ocr:
 # 2. 질문 · 정답
 # ---------------------------------------------------------------------------
 with tab_qa:
-    if "eval_qa" not in st.session_state:
-        st.session_state["eval_qa"] = ev.load_qa(config.EVAL_QA_FILE) if config.EVAL_QA_FILE.exists() else []
+    if QA_KEY not in st.session_state:
+        st.session_state[QA_KEY] = ev.load_qa(doc.qa_file) if doc.qa_file.exists() else []
     st.caption(
-        f"평가 세트: `{config.EVAL_QA_FILE.relative_to(config.EVAL_DIR.parent.parent)}` · "
+        f"평가 세트: `{doc.qa_file.relative_to(config.EVAL_DIR.parent.parent)}` "
+        f"({'없음 — 생성 후 저장하세요' if not doc.qa_file.exists() else f'{len(st.session_state[QA_KEY])}문항'}) · "
         "paraphrase는 같은 질문을 문서 표현을 피해 사용자 말투로 바꾼 것 (생성된 질문은 문서 문장을 그대로 써서 검색이 쉬움)"
     )
     edited = st.data_editor(
-        pd.DataFrame([asdict(item) for item in st.session_state["eval_qa"]],
+        pd.DataFrame([asdict(item) for item in st.session_state[QA_KEY]],
                      columns=["id", "answerable", "page", "question", "paraphrase", "answer", "note"]),
-        num_rows="dynamic", width="stretch", height=420, key="qa_editor",
+        num_rows="dynamic", width="stretch", height=420, key=f"qa_editor_{settings.eval_doc}",
         column_config={
             "id": st.column_config.NumberColumn(width="small"),
             "answerable": st.column_config.CheckboxColumn("답 있음", width="small", default=True,
@@ -204,17 +215,17 @@ with tab_qa:
                       note=str(r.note or ""), paraphrase=str(r.paraphrase or ""), answerable=bool(r.answerable))
             for r in edited.dropna(subset=["question", "answer", "page"]).itertuples()
         ]
-        ev.save_qa(config.EVAL_QA_FILE, items)
-        st.session_state["eval_qa"] = items
+        ev.save_qa(doc.qa_file, items)
+        st.session_state[QA_KEY] = items
         st.success(f"{len(items)}개 저장")
     count = c2.number_input("생성 개수", 1, 50, config.EVAL_QUESTION_COUNT, label_visibility="collapsed")
     if c3.button(f"OCR 결과로 Gemini가 {count}개 새로 생성", disabled="eval_ocr" not in st.session_state):
         with st.spinner("질문 · 정답 생성 중…"):
             try:
-                st.session_state["eval_qa"] = ev.generate_qa(
+                st.session_state[QA_KEY] = ev.generate_qa(
                     get_llm(settings.llm_model, 16384), st.session_state["eval_ocr"]["pages"], count,
                 )
-                st.session_state.pop("qa_editor", None)
+                st.session_state.pop(f"qa_editor_{settings.eval_doc}", None)
                 st.rerun()
             except Exception as e:
                 show_error("질문 생성", e)
@@ -224,7 +235,7 @@ with tab_qa:
 # 3. RAG 평가
 # ---------------------------------------------------------------------------
 with tab_eval:
-    items: list[ev.QAItem] = st.session_state.get("eval_qa", [])
+    items: list[ev.QAItem] = st.session_state.get(QA_KEY, [])
     try:
         info = rag.get_collection_info(settings.collection) or {}
     except Exception as e:

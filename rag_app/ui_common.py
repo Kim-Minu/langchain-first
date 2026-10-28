@@ -19,7 +19,8 @@ DEFAULTS = {
     "cfg_embedding_model": config.EMBEDDING_MODEL,
     "cfg_embedding_dim": config.EMBEDDING_DIMENSION,
     "cfg_collection": config.COLLECTION_NAME,
-    "cfg_eval_collection": config.EVAL_COLLECTION,
+    "cfg_eval_doc": config.EVAL_DOC,
+    "cfg_eval_collection": config.EVAL_DOCS[config.EVAL_DOC].collection,
     "cfg_top_k": config.TOP_K,
     "cfg_llm_choice": config.LLM_GEMINI,
     "cfg_llm_model": config.LLM_MODEL,
@@ -46,6 +47,7 @@ class Settings:
     max_output_tokens: int
     instructions: str
     judge_model: str  # 평가 화면의 채점 · 근거 충실도 판정 모델
+    eval_doc: str  # 평가 화면의 평가 문서 (config.EVAL_DOCS 키)
 
     @property
     def chunk_ok(self) -> bool:
@@ -56,17 +58,33 @@ class Settings:
         return config.OLLAMA_MODEL if self.llm_choice == config.LLM_OLLAMA_GEMMA else self.llm_model
 
 
+def _follow_eval_doc() -> None:
+    """평가 문서를 바꾸면 컬렉션 이름도 그 문서의 기본 컬렉션으로."""
+    st.session_state["cfg_eval_collection"] = config.EVAL_DOCS[st.session_state["cfg_eval_doc"]].collection
+
+
 def render_sidebar(page: str = "main") -> Settings:
     """사이드바 설정. page='eval'이면 이미지 읽기 대신 OCR 프롬프트를, 컬렉션은 평가용 이름을 보여 줌."""
     for key, default in DEFAULTS.items():
         st.session_state[key] = st.session_state.get(key, default)
 
     with st.sidebar:
+        # 프로젝트 공통 .streamlit/config.toml이 자동 페이지 목록을 숨기므로(web_chat.py용 showSidebarNavigation = false)
+        # 두 화면 사이 이동 링크를 직접 둠
+        st.page_link("app.py", label="PDF RAG 실습", icon="📄")
+        st.page_link("pages/ocr_eval.py", label="OCR · RAG 평가", icon="🔎")
+        st.divider()
         st.header("설정")
         st.caption("두 화면(PDF RAG 실습 · OCR · RAG 평가)이 같은 설정을 공유합니다.")
 
         st.subheader("A. 인덱싱")
         if page == "eval":
+            st.selectbox(
+                "평가 문서", list(config.EVAL_DOCS), format_func=lambda key: config.EVAL_DOCS[key].label,
+                key="cfg_eval_doc", on_change=_follow_eval_doc,
+                help="고르면 PDF · 질문 세트 · 컬렉션이 함께 바뀜. 컬렉션만 다른 문서 것으로 바꾸면 "
+                     "같은 질문을 더 큰 인덱스에서 평가할 수 있음 (예: 1~20쪽 질문을 1~100쪽 컬렉션에서)",
+            )
             st.text_area(
                 "OCR 프롬프트", key="cfg_ocr_prompt", height=220,
                 help="스캔한 페이지마다 Gemini에 이 지시와 함께 보냄. 바꾸면 OCR을 다시 실행 (결과는 프롬프트별로 캐시)",
@@ -138,6 +156,7 @@ def render_sidebar(page: str = "main") -> Settings:
         max_output_tokens=s.cfg_max_output_tokens,
         instructions=s.cfg_instructions,
         judge_model=s.cfg_judge_model,
+        eval_doc=s.cfg_eval_doc,
     )
     if not settings.chunk_ok:
         st.sidebar.error("청크 겹침은 청크 크기보다 작아야 합니다.")
