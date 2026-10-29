@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import streamlit as st
 
-from rag_app import config
+from rag_app import billing, config
 from rag_app import pipeline as rag
 
 # 사이드바 위젯의 기본값. 위젯은 key로만 만들고 값은 session_state에 둠
@@ -22,7 +22,7 @@ DEFAULTS = {
     "cfg_eval_doc": config.EVAL_DOC,
     "cfg_eval_collection": config.EVAL_DOCS[config.EVAL_DOC].collection,
     "cfg_top_k": config.TOP_K,
-    "cfg_llm_choice": config.LLM_GEMINI,
+    "cfg_llm_choice": config.LLM_DEEPSEEK_FLASH,
     "cfg_llm_model": config.LLM_MODEL,
     "cfg_judge_model": config.JUDGE_MODEL,
     "cfg_max_output_tokens": config.MAX_OUTPUT_TOKENS,
@@ -55,7 +55,17 @@ class Settings:
 
     @property
     def answer_model(self) -> str:
-        return config.OLLAMA_MODEL if self.llm_choice == config.LLM_OLLAMA_GEMMA else self.llm_model
+        if self.llm_choice == config.LLM_DEEPSEEK_FLASH:
+            return config.DEEPSEEK_FLASH_MODEL
+        if self.llm_choice == config.LLM_GEMMA_26B:
+            return config.GEMMA_26B_MODEL
+        if self.llm_choice == config.LLM_GEMINI_FLASH_LITE:
+            return config.GEMINI_FLASH_LITE_MODEL
+        if self.llm_choice == config.LLM_CLAUDE_HAIKU:
+            return config.CLAUDE_HAIKU_MODEL
+        if self.llm_choice == config.LLM_OLLAMA_GEMMA:
+            return config.OLLAMA_MODEL
+        return self.llm_model
 
 
 def _follow_eval_doc() -> None:
@@ -73,7 +83,14 @@ def render_sidebar(page: str = "main") -> Settings:
         # 두 화면 사이 이동 링크를 직접 둠
         st.page_link("app.py", label="PDF RAG 실습", icon="📄")
         st.page_link("pages/ocr_eval.py", label="OCR · RAG 평가", icon="🔎")
+        st.page_link("pages/benchmark.py", label="LLM 성능 벤치마크", icon="⚡")
+        st.page_link("pages/billing_dashboard.py", label="과금 대시보드", icon="💰")
         st.divider()
+
+        # 실시간 과금 카운터 위젯 (모든 페이지 공통)
+        billing.render_billing_counter_widget()
+        st.divider()
+
         st.header("설정")
         st.caption("두 화면(PDF RAG 실습 · OCR · RAG 평가)이 같은 설정을 공유합니다.")
 
@@ -111,7 +128,13 @@ def render_sidebar(page: str = "main") -> Settings:
             "페이지를 넘어 이어서 청크 나누기", key="cfg_across_pages",
             help="페이지를 이어 붙인 뒤 나눠, 페이지 경계에서 끊긴 문장도 한 청크에 들어가게 함 (청크에 page ~ page_end 기록)",
         )
-        st.text_input("임베딩 모델 (Gemini)", key="cfg_embedding_model")
+        st.selectbox(
+            "임베딩 모델",
+            list(config.EMBEDDING_OPTIONS),
+            format_func=config.EMBEDDING_OPTIONS.get,
+            key="cfg_embedding_model",
+            help="문서 청크와 질문을 벡터로 변환하는 모델 (Vertex AI global)",
+        )
         st.selectbox(
             "임베딩 차원", config.EMBEDDING_DIMENSION_OPTIONS, key="cfg_embedding_dim",
             help="바꾸면 다시 인덱싱해야 함 (같은 컬렉션 안의 벡터는 차원이 같아야 비교 가능)",
@@ -125,10 +148,17 @@ def render_sidebar(page: str = "main") -> Settings:
             "답변 모델", list(config.LLM_OPTIONS), format_func=config.LLM_OPTIONS.get, captions=config.LLM_CAPTIONS,
             key="cfg_llm_choice",
         )
-        st.text_input(
-            "Gemini 모델 ID", key="cfg_llm_model",
-            help="Gemini 답변 · 이미지 읽기 · OCR · 채점에 사용 (Gemma를 골라도 이 작업들은 Gemini)",
-        )
+        selected_choice = st.session_state.get("cfg_llm_choice")
+        selected_id = {
+            config.LLM_DEEPSEEK_FLASH: config.DEEPSEEK_FLASH_MODEL,
+            config.LLM_GEMMA_26B: config.GEMMA_26B_MODEL,
+            config.LLM_GEMINI_FLASH_LITE: config.GEMINI_FLASH_LITE_MODEL,
+            config.LLM_CLAUDE_HAIKU: config.CLAUDE_HAIKU_MODEL,
+            config.LLM_GEMINI: config.LLM_MODEL,
+            config.LLM_OLLAMA_GEMMA: config.OLLAMA_MODEL,
+        }.get(selected_choice, "")
+        if selected_id:
+            st.caption(f"호출 모델 식별자: `{selected_id}`")
         st.number_input("출력 토큰 상한", 256, 65536, step=256, key="cfg_max_output_tokens")
         st.text_area("지시문 (시스템 프롬프트)", key="cfg_instructions", height=200)
         if page == "eval":
@@ -180,9 +210,7 @@ def get_llm(model: str, max_tokens: int):
 
 @st.cache_resource(show_spinner=False)
 def get_answer_llm(choice: str, gemini_model: str, max_tokens: int):
-    if choice == config.LLM_OLLAMA_GEMMA:
-        return rag.create_ollama_llm(config.OLLAMA_MODEL, max_tokens)
-    return get_llm(gemini_model, max_tokens)
+    return rag.create_answer_llm(choice, max_tokens, gemini_model)
 
 
 def step_header(label: str, title: str, caption: str) -> None:

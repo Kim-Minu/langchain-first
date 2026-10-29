@@ -183,7 +183,7 @@ k4.metric("응답당 평균 토큰", f"{total_tokens / responses:,.0f}" if respo
 # 기간 × 모델 쌓인 막대
 st.subheader(f"{PERIOD_LABELS[period]} {METRICS[metric]}")
 filled = fill_missing_periods(frame, period, start, end, models)
-st.altair_chart(period_chart(filled, metric, models), use_container_width=True)
+st.altair_chart(period_chart(filled, metric, models), width="stretch")
 
 # 모델별 요약
 st.subheader("모델별 합계")

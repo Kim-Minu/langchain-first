@@ -42,6 +42,7 @@ from langchain_postgres import PGVector
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from psycopg.types.json import Jsonb
 
+from rag_app import config
 from rag_app.config import (
     DATABASE_URL,
     EMBEDDING_CACHE,
@@ -532,6 +533,89 @@ def create_ollama_llm(model: str, max_output_tokens: int = MAX_OUTPUT_TOKENS) ->
     from langchain_ollama import ChatOllama
 
     return ChatOllama(model=model, temperature=0, num_predict=max_output_tokens)
+
+
+def create_deepseek_llm(max_output_tokens: int = MAX_OUTPUT_TOKENS) -> BaseChatModel:
+    """DeepSeek V4.1 Flash (Vertex AI MaaS OpenAPI)."""
+    from model_selector_chatbot.model_service import GcpMaasChatModel
+
+    _, project = _vertex_credentials()
+    proj = project or config.GOOGLE_CLOUD_PROJECT or "iceu-songpa05"
+    return GcpMaasChatModel(
+        model_name=config.DEEPSEEK_FLASH_MODEL,
+        project_id=proj,
+        region="global",
+        max_tokens=max_output_tokens,
+        service_name="DeepSeek V4.1 Flash API Service",
+    )
+
+
+def create_gemma_maas_llm(max_output_tokens: int = MAX_OUTPUT_TOKENS) -> BaseChatModel:
+    """Gemma 4 26B IT (Vertex AI MaaS OpenAPI, Thinking 지원)."""
+    from model_selector_chatbot.model_service import GcpMaasChatModel
+
+    _, project = _vertex_credentials()
+    proj = project or config.GOOGLE_CLOUD_PROJECT or "iceu-songpa05"
+    return GcpMaasChatModel(
+        model_name=config.GEMMA_26B_MODEL,
+        project_id=proj,
+        region="global",
+        max_tokens=max_output_tokens,
+        enable_thinking=True,
+        service_name="Gemma 4 26B IT API Service",
+    )
+
+
+def create_gemini_flash_lite_llm(max_output_tokens: int = MAX_OUTPUT_TOKENS) -> BaseChatModel:
+    """Gemini 3.5 Flash Lite (Vertex AI)."""
+    from gemini_flash_lite_chatbot.config import GeminiConfig
+    from gemini_flash_lite_chatbot.gemini_service import GeminiFlashLiteService
+
+    _, project = _vertex_credentials()
+    proj = project or config.GOOGLE_CLOUD_PROJECT or "iceu-songpa05"
+    cfg = GeminiConfig(
+        model_name=config.GEMINI_FLASH_LITE_MODEL,
+        project_id=proj,
+        location=config.LLM_LOCATION,
+        max_output_tokens=max_output_tokens,
+        reasoning_effort="low",
+    )
+    return GeminiFlashLiteService(config=cfg)
+
+
+def create_claude_haiku_llm(max_output_tokens: int = MAX_OUTPUT_TOKENS) -> BaseChatModel:
+    """Anthropic Claude Haiku 5.5 (Vertex AI Anthropic SDK)."""
+    from claude_haiku_chatbot.claude_service import ClaudeHaikuVertexChatModel
+    from claude_haiku_chatbot.config import ClaudeHaikuConfig
+
+    _, project = _vertex_credentials()
+    proj = project or config.GOOGLE_CLOUD_PROJECT or "iceu-songpa05"
+    cfg = ClaudeHaikuConfig(
+        model_name=config.CLAUDE_HAIKU_MODEL,
+        project_id=proj,
+        region="global",
+        max_tokens=max_output_tokens,
+    )
+    return ClaudeHaikuVertexChatModel(config=cfg)
+
+
+def create_answer_llm(
+    choice: str,
+    max_output_tokens: int = MAX_OUTPUT_TOKENS,
+    gemini_model: str = config.LLM_MODEL,
+) -> BaseChatModel:
+    """사이드바에서 선택된 모델 종류(choice)에 맞는 LLM 객체를 반환합니다."""
+    if choice == config.LLM_DEEPSEEK_FLASH:
+        return create_deepseek_llm(max_output_tokens)
+    if choice == config.LLM_GEMMA_26B:
+        return create_gemma_maas_llm(max_output_tokens)
+    if choice == config.LLM_GEMINI_FLASH_LITE:
+        return create_gemini_flash_lite_llm(max_output_tokens)
+    if choice == config.LLM_CLAUDE_HAIKU:
+        return create_claude_haiku_llm(max_output_tokens)
+    if choice == config.LLM_OLLAMA_GEMMA:
+        return create_ollama_llm(config.OLLAMA_MODEL, max_output_tokens)
+    return create_llm(gemini_model, max_output_tokens)
 
 
 def generate_answer(llm: BaseChatModel, messages: list[BaseMessage]):

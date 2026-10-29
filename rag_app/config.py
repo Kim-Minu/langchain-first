@@ -14,15 +14,64 @@ EMBEDDING_LOCATION = os.getenv("RAG_EMBEDDING_LOCATION", "global")
 EMBEDDING_MODEL = os.getenv("RAG_EMBEDDING_MODEL", "gemini-embedding-2")
 LLM_MODEL = os.getenv("RAG_LLM_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.8-flash"))
 
-# 답변 모델 선택지: {내부 키: 화면 표시 이름} (chat_app/config.py의 MODEL_OPTIONS와 같은 이름)
+# 임베딩 모델 선택지
+EMBEDDING_OPTIONS = {
+    "gemini-embedding-2": "Gemini Embedding 2 (기본 · 멀티모달 · global)",
+    "text-embedding-005": "Text Embedding 005 (Google 최신 텍스트)",
+    "text-multilingual-embedding-002": "Text Multilingual 002 (다국어 특화)",
+}
+
+# 모델 고유 식별자 (ID)
+DEEPSEEK_FLASH_MODEL = "deepseek-ai/deepseek-v4.1-flash-maas"
+GEMMA_26B_MODEL = "google/gemma-4-26b-a4b-it-maas"
+GEMINI_FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
+CLAUDE_HAIKU_MODEL = "claude-haiku-5-5"
+OLLAMA_MODEL = "gemma4:e2b"
+
+# 답변 모델 선택지: {내부 키: 화면 표시 이름}
+LLM_DEEPSEEK_FLASH = "DeepSeek V4.1 Flash (Vertex MaaS)"
+LLM_GEMMA_26B = "Gemma 4 26B A4B IT (Vertex MaaS)"
+LLM_GEMINI_FLASH_LITE = "Gemini 3.5 Flash Lite (Vertex AI)"
+LLM_CLAUDE_HAIKU = "Claude Haiku 5.5 (Vertex AI)"
 LLM_GEMINI = "Google Gemini (Vertex AI)"
 LLM_OLLAMA_GEMMA = "Ollama Gemma (gemma4:e2b)"
+
 LLM_OPTIONS = {
-    LLM_GEMINI: "Gemini Flash",
-    LLM_OLLAMA_GEMMA: "Gemma 4 (로컬)",
+    LLM_DEEPSEEK_FLASH: "DeepSeek V4.1 Flash (MaaS)",
+    LLM_GEMMA_26B: "Gemma 4 26B (MaaS Thinking)",
+    LLM_GEMINI_FLASH_LITE: "Gemini 3.5 Flash Lite",
+    LLM_CLAUDE_HAIKU: "Claude Haiku 5.5 (Vertex)",
+    LLM_GEMINI: "Gemini 3.8 Flash (Vertex AI)",
+    LLM_OLLAMA_GEMMA: "Gemma 4 (로컬 Ollama)",
 }
-LLM_CAPTIONS = ["Vertex AI · 빠른 응답", "Ollama · 로컬 실행, 무료"]
-OLLAMA_MODEL = "gemma4:e2b"
+LLM_CAPTIONS = [
+    "Vertex MaaS · 초고속 Flash",
+    "Vertex MaaS · 128k 추론(Thinking)",
+    "Vertex AI · 초경량 고속",
+    "Anthropic Vertex · 차세대 Haiku",
+    "Vertex AI · 빠른 응답",
+    "Ollama · 로컬 실행, 무료",
+]
+
+# 1M(백만) 토큰당 단가 (USD 기준, GCP Model Garden & Partner Models 공식 정가 기준)
+# 참조:
+# https://cloud.google.com/model-garden/pricing#cost-of-building-and-deploying-ai-models-in-agent-platform
+# https://cloud.google.com/model-garden/partner-models/pricing#partner-models-on-agent-platform
+MODEL_PRICING = {
+    # Partner Models (Model as a Service / Agent Platform)
+    DEEPSEEK_FLASH_MODEL: {"name": "DeepSeek V4.1 Flash (MaaS)", "input": 0.14, "output": 0.28},
+    GEMMA_26B_MODEL: {"name": "Gemma 4 26B (MaaS)", "input": 0.20, "output": 0.40},
+    CLAUDE_HAIKU_MODEL: {"name": "Claude Haiku 5.5 (Vertex)", "input": 0.80, "output": 4.00},
+    # First-Party Models (Vertex AI Gemini)
+    GEMINI_FLASH_LITE_MODEL: {"name": "Gemini 3.5 Flash Lite", "input": 0.075, "output": 0.30},
+    "gemini-3.8-flash": {"name": "Gemini 3.8 Flash", "input": 0.15, "output": 0.60},
+    # Embeddings
+    "gemini-embedding-2": {"name": "Gemini Embedding 2", "input": 0.025, "output": 0.0},
+    "text-embedding-005": {"name": "Text Embedding 005", "input": 0.025, "output": 0.0},
+    "text-multilingual-embedding-002": {"name": "Text Multilingual 002", "input": 0.025, "output": 0.0},
+    # Local Models (Free)
+    OLLAMA_MODEL: {"name": "Gemma 4 (로컬 Ollama)", "input": 0.0, "output": 0.0},
+}
 
 # 벡터 스토어: docker-compose.yml의 PostgreSQL(pgvector) — chat_app과 같은 DB를 쓰고 테이블만 분리
 # (langchain-postgres가 langchain_pg_collection / langchain_pg_embedding 테이블을 만들어 관리)

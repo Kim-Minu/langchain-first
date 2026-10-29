@@ -18,6 +18,7 @@ B. 질문에 답하기 (런타임): 질문 입력 → 관련 청크 검색 → �
 """
 
 import sys
+import time
 from pathlib import Path
 
 # streamlit run은 스크립트 폴더(rag_app/)만 import 경로에 넣으므로 프로젝트 루트를 추가
@@ -26,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import streamlit as st
 
-from rag_app import config
+from rag_app import benchmark_service, billing, config
 from rag_app import pipeline as rag
 from rag_app.ui_common import (
     get_answer_llm,
@@ -63,6 +64,18 @@ def run_index_steps(result: dict, data: bytes, file_name: str, index_info: dict)
     )
     result["pages"] = rag.load_pdf(data, file_name, image_reader)
     result["image_failures"] = image_reader.failures if image_reader else []
+
+    # 과금 카운터: 이미지 OCR 변환 과금 기록
+    if use_images and result["pages"]:
+        img_count = sum(p.page_content.count(rag.IMAGE_TEXT_MARK) for p in result["pages"])
+        if img_count > 0:
+            billing.record_billing_event(
+                stage="문서 이미지 읽기 (OCR)",
+                model_id=llm_model,
+                input_tokens=img_count * 258,
+                output_tokens=img_count * 300,
+            )
+
     st.write("2) 청크로 나누기")
     result["chunks"] = rag.split_documents(result["pages"], chunk_size, chunk_overlap, across_pages)
     if not result["chunks"]:
@@ -74,6 +87,18 @@ def run_index_steps(result: dict, data: bytes, file_name: str, index_info: dict)
     st.write(f"3) 임베딩하기 ({len(result['chunks'])}개 청크)")
     embeddings = get_embeddings(embedding_model, embedding_dim)
     result["vectors"], result["embedding_cache_hits"] = rag.embed_chunks(embeddings, result["chunks"])
+
+    # 과금 카운터: 신규 임베딩(캐시 미적용분) 과금 기록
+    api_chunks = len(result["chunks"]) - result.get("embedding_cache_hits", 0)
+    if api_chunks > 0:
+        total_chars = sum(len(c.page_content) for c in result["chunks"][:api_chunks])
+        in_tokens = max(1, int(total_chars / 2.2))
+        billing.record_billing_event(
+            stage="문서 청크 임베딩",
+            model_id=embedding_model,
+            input_tokens=in_tokens,
+            output_tokens=0,
+        )
     st.write("4) 벡터 스토어 저장")
     store = get_store(embedding_model, embedding_dim, collection_name)
     result["ids"] = rag.save_to_store(
@@ -306,19 +331,56 @@ with tab_query:
     if asked and question.strip():
         qa: dict = {"question": question.strip(), "k": top_k, "answer_model": answer_model}
         st.session_state.pop("qa_result", None)
+        st.session_state.pop("compare_results", None)
         with st.status("답변 생성 중…", expanded=True) as status:
             try:
+                t0 = time.perf_counter()
                 embeddings = get_embeddings(embedding_model, embedding_dim)
                 store = get_store(embedding_model, embedding_dim, collection_name)
+                
+                t1 = time.perf_counter()
                 st.write("1) 질문 임베딩")
                 qa["vector"] = rag.embed_question(embeddings, qa["question"])
+                t2 = time.perf_counter()
+                billing.record_billing_event(
+                    stage="질문 임베딩",
+                    model_id=embedding_model,
+                    input_tokens=max(1, int(len(qa["question"]) / 2.2)),
+                    output_tokens=0,
+                )
+
                 st.write("2) 관련 청크 검색")
                 qa["hits"] = rag.search_chunks(store, qa["vector"], top_k)
+                t3 = time.perf_counter()
+
                 st.write("3) 프롬프트 구성")
                 qa["messages"] = rag.build_prompt(instructions, [doc for doc, _ in qa["hits"]], qa["question"])
+
                 st.write("4) LLM 답변")
+                t4 = time.perf_counter()
                 llm = get_answer_llm(llm_choice, llm_model, max_output_tokens)
                 qa["answer"] = rag.generate_answer(llm, qa["messages"])
+                t5 = time.perf_counter()
+
+                # 과금 카운터: LLM 답변 과금 기록
+                usage = getattr(qa["answer"], "usage_metadata", None) or {}
+                in_tok = usage.get("input_tokens") or benchmark_service.estimate_tokens(" ".join(str(m.content) for m in qa["messages"]))
+                out_tok = usage.get("output_tokens") or benchmark_service.estimate_tokens(getattr(qa["answer"], "text", ""))
+                billing.record_billing_event(
+                    stage="RAG LLM 답변",
+                    model_id=answer_model,
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                )
+
+                qa["perf"] = {
+                    "embed_sec": t2 - t1,
+                    "search_sec": t3 - t2,
+                    "retrieval_sec": t3 - t1,
+                    "llm_sec": t5 - t4,
+                    "total_sec": t5 - t0,
+                }
+
                 if run_chain_too:
                     st.write("+) LCEL 체인 실행")
                     qa["chain_answer"] = rag.build_rag_chain(store, llm, instructions, top_k).invoke(qa["question"])
@@ -373,11 +435,82 @@ with tab_query:
             answer = qa["answer"]
             step_header("B-4", "LLM → 답변", f"근거를 읽고 생성 · {qa['answer_model']}")
             st.markdown(answer.text)
+
             usage = answer.usage_metadata or {}
-            c1, c2, c3 = st.columns(3)
-            c1.metric("입력 토큰", f"{usage.get('input_tokens', 0):,}")
-            c2.metric("출력 토큰", f"{usage.get('output_tokens', 0):,}")
-            c3.metric("합계", f"{usage.get('total_tokens', 0):,}")
+            perf = qa.get("perf", {})
+            in_tokens = usage.get("input_tokens", 0)
+            out_tokens = usage.get("output_tokens", 0)
+            llm_sec = perf.get("llm_sec", 0.0)
+            total_sec = perf.get("total_sec", 0.0)
+            retrieval_sec = perf.get("retrieval_sec", 0.0)
+            throughput = (out_tokens / max(0.001, llm_sec)) if out_tokens > 0 else 0
+            costs = benchmark_service.calculate_cost(qa["answer_model"], in_tokens, out_tokens)
+
+            st.markdown("##### ⏱️ 성능 및 비용 측정")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric(
+                "전체 소요 시간",
+                f"{total_sec:.2f}초",
+                help=f"검색 {retrieval_sec:.2f}초 (임베딩 {perf.get('embed_sec', 0):.2f}초 + 청크검색 {perf.get('search_sec', 0):.2f}초) + LLM 생성 {llm_sec:.2f}초",
+            )
+            c2.metric("생성 속도", f"{throughput:.1f} 토큰/초" if throughput > 0 else "-")
+            c3.metric(
+                "토큰 (입력 / 출력)",
+                f"{in_tokens:,} / {out_tokens:,}",
+                help=f"총 {in_tokens + out_tokens:,} 토큰",
+            )
+            c4.metric(
+                "1회 질의 비용",
+                f"₩{costs['cost_krw']:.2f}",
+                help=f"${costs['cost_usd']:.5f} (1,000회 질의 시 약 ${costs['cost_1k_usd']:.3f} / ₩{costs['cost_1k_krw']:,.0f})",
+            )
+
+            with st.expander("⚡ 이 검색 결과(동일 문서 청크)로 다른 모델들과 RAG 답변 성능 비교"):
+                st.caption("방금 PGVector에서 검색한 동일 청크들을 바탕으로 5대 모델의 응답 속도, 토큰량, 1회 비용, 답변을 나란히 비교합니다.")
+                if st.button("🚀 5대 모델 RAG 응답 성능 비교 실행", key="btn_run_compare"):
+                    with st.spinner("모든 모델에 대해 RAG 답변 생성 및 성능 측정 중..."):
+                        compare_results = []
+                        target_models = [
+                            config.LLM_DEEPSEEK_FLASH,
+                            config.LLM_GEMMA_26B,
+                            config.LLM_GEMINI_FLASH_LITE,
+                            config.LLM_CLAUDE_HAIKU,
+                            config.LLM_GEMINI,
+                        ]
+                        for m_key in target_models:
+                            r = benchmark_service.run_single_benchmark(
+                                choice=m_key,
+                                prompt=qa["question"],
+                                messages=qa["messages"],
+                                search_time_sec=retrieval_sec,
+                                max_output_tokens=max_output_tokens,
+                            )
+                            compare_results.append(r)
+                        st.session_state["compare_results"] = compare_results
+
+                compare_data = st.session_state.get("compare_results")
+                if compare_data:
+                    c_rows = []
+                    for cr in compare_data:
+                        c_rows.append({
+                            "모델": cr.model_name,
+                            "TTFT": f"{cr.ttft_sec:.2f}초",
+                            "전체 시간": f"{cr.total_time_sec:.2f}초",
+                            "생성 속도": f"{cr.throughput:.1f} t/s",
+                            "입력/출력 토큰": f"{cr.input_tokens:,} / {cr.output_tokens:,}",
+                            "1회 예상 비용": f"₩{cr.cost_krw:.2f}",
+                            "1,000회 비용": f"₩{cr.cost_1k_krw:,.0f} (${cr.cost_1k_usd:.3f})",
+                            "상태": "❌ 오류" if cr.error else "✅ 정상",
+                        })
+                    st.dataframe(pd.DataFrame(c_rows), width="stretch")
+
+                    cmp_tabs = st.tabs([cr.model_name for cr in compare_data])
+                    for t, cr in zip(cmp_tabs, compare_data):
+                        with t:
+                            if cr.error:
+                                st.error(cr.error)
+                            else:
+                                st.markdown(cr.response_text)
 
         if "chain_answer" in qa:
             st.divider()
