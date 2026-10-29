@@ -20,6 +20,7 @@ import bisect
 import hashlib
 import io
 import json
+import re
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -339,6 +340,47 @@ class CachedEmbeddings(Embeddings):
         return vector
 
 
+def get_embedding_cache_stats() -> dict:
+    """PostgreSQL embedding_cache 테이블의 통계(전체 개수, 문서/질문별 개수, 최신 캐시 일시 등)를 조회합니다."""
+    if not EMBEDDING_CACHE:
+        return {"enabled": False, "total": 0, "doc_count": 0, "query_count": 0, "last_cached_at": None}
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            conn.execute(EMBEDDING_CACHE_DDL)
+            row = conn.execute(
+                """
+                SELECT 
+                    count(*) as total,
+                    count(*) FILTER (WHERE task_type = 'RETRIEVAL_DOCUMENT') as doc_count,
+                    count(*) FILTER (WHERE task_type = 'RETRIEVAL_QUERY') as query_count,
+                    max(created_at) as last_cached_at
+                FROM embedding_cache
+                """
+            ).fetchone()
+            if row:
+                return {
+                    "enabled": True,
+                    "total": row[0] or 0,
+                    "doc_count": row[1] or 0,
+                    "query_count": row[2] or 0,
+                    "last_cached_at": row[3],
+                }
+    except Exception:
+        pass
+    return {"enabled": EMBEDDING_CACHE, "total": 0, "doc_count": 0, "query_count": 0, "last_cached_at": None}
+
+
+def clear_embedding_cache() -> int:
+    """PostgreSQL embedding_cache 테이블의 모든 캐시 데이터를 삭제합니다."""
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            conn.execute(EMBEDDING_CACHE_DDL)
+            cur = conn.execute("DELETE FROM embedding_cache")
+            return cur.rowcount
+    except Exception:
+        return 0
+
+
 def create_embeddings(model: str, dimension: int) -> CachedEmbeddings:
     credentials, project = _vertex_credentials()
     gemini = GoogleGenerativeAIEmbeddings(
@@ -375,6 +417,72 @@ def get_vector_store(embeddings: Embeddings, collection_name: str) -> PGVector:
 
 def file_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def slugify(text: str, max_length: int = 24) -> str:
+    """파일명 등에서 한글, 영문, 숫자를 제외한 특수문자를 언더스코어로 치환하고 길이를 제한."""
+    stem = Path(text).stem
+    slug = re.sub(r"[^\w\s-]", "", stem).strip()
+    slug = re.sub(r"[-\s]+", "_", slug)
+    if not slug:
+        slug = "doc"
+    return slug[:max_length].rstrip("_")
+
+
+def build_collection_name(
+    file_name: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    embedding_dim: int,
+    image_mode: str = "",
+) -> str:
+    """문서명과 파이프라인 하이퍼파라미터를 결합하여 고유한 컬렉션 이름을 생성."""
+    slug = slugify(file_name)
+    ocr_suffix = "_ocr" if image_mode == config.IMAGE_GEMINI else ""
+    return f"{slug}_c{chunk_size}_o{chunk_overlap}_d{embedding_dim}{ocr_suffix}"
+
+
+def list_stored_collections() -> list[dict]:
+    """DB에 저장된 pgvector 컬렉션 목록과 메타데이터, 청크 수를 반환."""
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            rows = conn.execute(
+                """
+                SELECT c.name,
+                       c.cmetadata,
+                       (SELECT count(*) FROM langchain_pg_embedding e WHERE e.collection_id = c.uuid) AS stored_chunks
+                FROM langchain_pg_collection c
+                ORDER BY c.name
+                """
+            ).fetchall()
+            return [
+                {
+                    "name": row[0],
+                    "metadata": row[1] or {},
+                    "stored_chunks": row[2] or 0,
+                    "file_name": (row[1] or {}).get("file_name", ""),
+                    "indexed_at": (row[1] or {}).get("indexed_at", ""),
+                }
+                for row in rows
+            ]
+    except Exception:
+        return []
+
+
+def delete_stored_collection(collection_name: str) -> bool:
+    """지정한 컬렉션과 소속 임베딩을 DB에서 완전히 삭제."""
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            cur = conn.execute("SELECT uuid FROM langchain_pg_collection WHERE name = %s", (collection_name,))
+            row = cur.fetchone()
+            if not row:
+                return False
+            coll_uuid = row[0]
+            conn.execute("DELETE FROM langchain_pg_embedding WHERE collection_id = %s", (coll_uuid,))
+            conn.execute("DELETE FROM langchain_pg_collection WHERE uuid = %s", (coll_uuid,))
+            return True
+    except Exception:
+        return False
 
 
 def make_index_key(file_hash: str, content_settings: dict) -> str:

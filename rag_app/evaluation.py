@@ -10,6 +10,7 @@
 import hashlib
 import json
 import time
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -21,6 +22,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_postgres import PGVector
 from pydantic import BaseModel, Field
 
+from rag_app import billing
 from rag_app import pipeline as rag
 from rag_app.config import (
     EVAL_CONCURRENCY,
@@ -220,13 +222,36 @@ def evaluate_one(
     instructions: str,
     k: int,
     use_paraphrase: bool = False,
+    chunk_size: int = 0,
+    chunk_overlap: int = 0,
 ) -> EvalResult:
     question = item.paraphrase if use_paraphrase and item.paraphrase else item.question
     result = EvalResult(item.id, question, item.answer, item.page, answerable=item.answerable)
+    coll = getattr(store, "collection_name", "-")
+    run_id = f"eval_{item.id}_{int(time.time())}_{uuid.uuid4().hex[:4]}"
     try:
+        t_emb_start = time.perf_counter()
+        query_vec = rag.embed_question(store.embeddings, question)
+        t_emb_end = time.perf_counter()
         hits = _with_rate_limit_retry(
-            lambda: rag.search_chunks(store, rag.embed_question(store.embeddings, question), k)
+            lambda: rag.search_chunks(store, query_vec, k)
         )
+        # 질문 임베딩 과금 기록
+        emb_model = getattr(store.embeddings, "model_name", None) or getattr(store.embeddings, "model", "gemini-embedding-2")
+        billing.record_billing_event(
+            stage="질문 임베딩",
+            model_id=emb_model,
+            input_tokens=max(1, int(len(question) / 2.2)),
+            output_tokens=0,
+            collection_name=coll,
+            run_id=run_id,
+            prompt=question,
+            latency_sec=round(max(0.001, t_emb_end - t_emb_start), 3),
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            top_k=k,
+        )
+
         docs = [doc for doc, _ in hits]
         started = time.perf_counter()  # 할당량 대기 시간이 섞이지 않게 답변 호출만 잼
         reply = _with_rate_limit_retry(
@@ -234,7 +259,9 @@ def evaluate_one(
         )
         result.latency = round(time.perf_counter() - started, 2)
         result.answer = reply.text
-        result.tokens = (reply.usage_metadata or {}).get("total_tokens", 0)
+        ans_usage = getattr(reply, "usage_metadata", None) or {}
+        result.tokens = ans_usage.get("total_tokens", 0)
+
         result.retrieved = [
             {
                 "page": doc.metadata.get("page"),
@@ -251,6 +278,28 @@ def evaluate_one(
         result.faithfulness, result.unsupported = _with_rate_limit_retry(
             lambda: check_faithfulness(judge_llm, rag.format_context(docs), result.answer)
         )
+
+        # RAG LLM 답변 과금 기록 (평가 점수 및 충실도 포함)
+        eval_score = 1.0 if result.verdict == "correct" else (0.5 if result.verdict == "partial" else 0.0)
+        ans_model = getattr(answer_llm, "model_name", None) or getattr(answer_llm, "model", "gemini-2.5-flash")
+        out_tokens = ans_usage.get("output_tokens", 0)
+        throughput = (out_tokens / max(0.001, result.latency)) if out_tokens > 0 else 0.0
+        billing.record_billing_event(
+            stage="RAG LLM 답변 (평가)",
+            model_id=ans_model,
+            input_tokens=ans_usage.get("input_tokens", max(1, int(len(str(reply.text)) / 2.2))),
+            output_tokens=out_tokens,
+            collection_name=coll,
+            run_id=run_id,
+            prompt=question,
+            latency_sec=result.latency,
+            throughput=round(throughput, 1),
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            top_k=k,
+            eval_score=eval_score,
+            faithfulness=result.faithfulness,
+        )
     except Exception as e:  # 한 문항의 실패가 전체 평가를 멈추지 않게
         result.verdict, result.reason = "error", f"{type(e).__name__}: {str(e)[:200]}"
     return result
@@ -266,11 +315,13 @@ def evaluate(
     use_paraphrase: bool = False,
     concurrency: int = EVAL_CONCURRENCY,
     on_done: Callable[[int, EvalResult], None] | None = None,
+    chunk_size: int = 0,
+    chunk_overlap: int = 0,
 ) -> list[EvalResult]:
     """질문들을 concurrency개씩 동시에 평가. on_done(끝난 개수, 결과)은 호출한 스레드에서 불림 (화면 진행 표시용)."""
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {
-            pool.submit(evaluate_one, item, store, answer_llm, judge_llm, instructions, k, use_paraphrase): item.id
+            pool.submit(evaluate_one, item, store, answer_llm, judge_llm, instructions, k, use_paraphrase, chunk_size, chunk_overlap): item.id
             for item in items
         }
         results = []

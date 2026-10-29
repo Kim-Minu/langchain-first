@@ -4,8 +4,13 @@
 import argparse
 import sys
 import time
+import uuid
+from pathlib import Path
 
-from rag_app import benchmark_service, config
+# 프로젝트 루트를 import 경로에 추가하여 단독 실행 가능하도록 지원
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from rag_app import benchmark_service, billing, config
 from rag_app import pipeline as rag
 
 
@@ -44,6 +49,7 @@ def main():
 
     messages = None
     search_time = 0.0
+    cli_run_id = f"cli_{int(time.time())}_{uuid.uuid4().hex[:4]}"
 
     if args.rag:
         print("\n🔍 1단계: PostgreSQL pgvector에서 관련 문서 청크 검색 중...")
@@ -52,9 +58,20 @@ def main():
             embeddings = rag.create_embeddings(config.EMBEDDING_MODEL, config.EMBEDDING_DIMENSION)
             store = rag.create_vector_store(args.collection, embeddings)
             q_vec = rag.embed_question(embeddings, args.prompt)
-            hits = rag.search_chunks(store, q_vec, args.top_k)
             t1 = time.perf_counter()
             search_time = max(0.001, t1 - t0)
+            # 질문 임베딩 과금 기록
+            billing.record_billing_event(
+                stage="질문 임베딩",
+                model_id=config.EMBEDDING_MODEL,
+                input_tokens=max(1, int(len(args.prompt) / 2.2)),
+                output_tokens=0,
+                collection_name=args.collection,
+                run_id=cli_run_id,
+                latency_sec=round(search_time, 3),
+                top_k=args.top_k,
+            )
+            hits = rag.search_chunks(store, q_vec, args.top_k)
             print(f"  • 검색 완료: {len(hits)}개 청크 검색됨 ({search_time:.3f}초 소요)")
             messages = rag.build_prompt(config.SYSTEM_PROMPT, [d for d, _ in hits], args.prompt)
             total_chars = sum(len(str(m.content)) for m in messages)
@@ -81,6 +98,9 @@ def main():
             messages=messages,
             search_time_sec=search_time,
             max_output_tokens=args.max_tokens,
+            collection_name=args.collection if args.rag else "-",
+            run_id=cli_run_id,
+            top_k=args.top_k if args.rag else 0,
         )
         status = "❌ 실패" if res.error else "✅ 성공"
         print(f"\n▶ [{res.model_name}] ({res.model_id}) - {status}")

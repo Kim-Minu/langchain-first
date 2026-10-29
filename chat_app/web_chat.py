@@ -23,8 +23,14 @@
 
 실행 방법:
     docker compose up -d          # 로컬 PostgreSQL 실행 (DATABASE_URL로 다른 DB 지정 가능)
-    uv run streamlit run web_chat.py
+    uv run streamlit run chat_app/web_chat.py
 """
+
+import sys
+from pathlib import Path
+
+# 프로젝트 루트를 sys.path에 추가 (chat_app 패키지 임포트 지원)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st
 

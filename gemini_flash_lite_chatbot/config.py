@@ -42,9 +42,10 @@ class GeminiConfig:
     api_key: str | None = os.getenv("GEMINI_API_KEY", os.getenv("GOOGLE_API_KEY", None))
 
     # 추론 파라미터
-    temperature: float = float(os.getenv("GEMINI_TEMPERATURE", "0.7"))
+    # (Flash Lite는 고정 샘플링 기본값을 강제하므로 temperature, top_p는 기본적으로 생략하여 경고 방지)
+    temperature: Optional[float] = float(os.getenv("GEMINI_TEMPERATURE")) if os.getenv("GEMINI_TEMPERATURE") else None
     max_output_tokens: int = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "4096"))
-    top_p: float = float(os.getenv("GEMINI_TOP_P", "0.95"))
+    top_p: Optional[float] = float(os.getenv("GEMINI_TOP_P")) if os.getenv("GEMINI_TOP_P") else None
     reasoning_effort: str = os.getenv("GEMINI_REASONING_EFFORT", "low")  # low | medium | high
     timeout: float = float(os.getenv("GEMINI_TIMEOUT", "60.0"))
 

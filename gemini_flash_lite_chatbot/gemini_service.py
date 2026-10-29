@@ -50,9 +50,9 @@ class GeminiFlashLiteService(BaseChatModel):
     location: str = Field(default="global", description="GCP 리전")
     vertexai: bool = Field(default=True, description="Vertex AI 사용 여부")
     api_key: Optional[str] = Field(default=None, description="Google API Key (선택)")
-    temperature: float = Field(default=0.7, description="생성 다양성")
+    temperature: Optional[float] = Field(default=None, description="생성 다양성 (Lite 모델은 고정 샘플링)")
     max_output_tokens: int = Field(default=4096, description="최대 출력 토큰")
-    top_p: float = Field(default=0.95, description="Top-P")
+    top_p: Optional[float] = Field(default=None, description="Top-P (Lite 모델은 고정 샘플링)")
     reasoning_effort: str = Field(default="low", description="추론 수준 (low, medium, high)")
     timeout: float = Field(default=60.0, description="타임아웃(초)")
     mock_mode: bool = Field(default=False, description="테스트용 오프라인 모드")
@@ -93,12 +93,19 @@ class GeminiFlashLiteService(BaseChatModel):
 
             client_kwargs: Dict[str, Any] = {
                 "model": self.model_name,
-                "temperature": self.temperature,
                 "max_output_tokens": self.max_output_tokens,
-                "top_p": self.top_p,
                 "timeout": self.timeout,
                 "streaming": True,
             }
+
+            # Flash Lite 모델은 고정 샘플링(fixed sampling defaults)을 강제하므로
+            # temperature와 top_p를 전달하면 UserWarning이 발생합니다.
+            # "lite"가 포함되지 않은 일반 모델이거나 명시적으로 설정된 경우에만 추가합니다.
+            if "lite" not in self.model_name.lower():
+                if self.temperature is not None:
+                    client_kwargs["temperature"] = self.temperature
+                if self.top_p is not None:
+                    client_kwargs["top_p"] = self.top_p
 
             if self.api_key:
                 client_kwargs["google_api_key"] = self.api_key

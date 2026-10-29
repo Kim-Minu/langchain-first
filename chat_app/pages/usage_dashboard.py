@@ -6,7 +6,12 @@
 - 채팅 화면 사이드바의 "사용량 대시보드" 링크로 열고, 상단 링크로 돌아갑니다.
 """
 
+import sys
 from datetime import date, timedelta
+from pathlib import Path
+
+# 프로젝트 루트를 sys.path에 추가 (chat_app 패키지 임포트 지원)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import altair as alt
 import pandas as pd

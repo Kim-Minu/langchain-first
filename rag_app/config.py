@@ -55,13 +55,14 @@ LLM_CAPTIONS = [
 
 # 1M(백만) 토큰당 단가 (USD 기준, GCP Model Garden & Partner Models 공식 정가 기준)
 # 참조:
-# https://cloud.google.com/model-garden/pricing#cost-of-building-and-deploying-ai-models-in-agent-platform
-# https://cloud.google.com/model-garden/partner-models/pricing#partner-models-on-agent-platform
+# - https://cloud.google.com/model-garden/pricing#cost-of-building-and-deploying-ai-models-in-agent-platform
+# - https://cloud.google.com/model-garden/partner-models/pricing#partner-models-on-agent-platform
+# (표준 <= 200k 토큰, HTTP 200 성공 응답 기준)
 MODEL_PRICING = {
     # Partner Models (Model as a Service / Agent Platform)
+    CLAUDE_HAIKU_MODEL: {"name": "Claude Haiku 5.5 (Vertex)", "input": 1.00, "output": 5.00},
     DEEPSEEK_FLASH_MODEL: {"name": "DeepSeek V4.1 Flash (MaaS)", "input": 0.14, "output": 0.28},
     GEMMA_26B_MODEL: {"name": "Gemma 4 26B (MaaS)", "input": 0.20, "output": 0.40},
-    CLAUDE_HAIKU_MODEL: {"name": "Claude Haiku 5.5 (Vertex)", "input": 0.80, "output": 4.00},
     # First-Party Models (Vertex AI Gemini)
     GEMINI_FLASH_LITE_MODEL: {"name": "Gemini 3.5 Flash Lite", "input": 0.075, "output": 0.30},
     "gemini-3.8-flash": {"name": "Gemini 3.8 Flash", "input": 0.15, "output": 0.60},

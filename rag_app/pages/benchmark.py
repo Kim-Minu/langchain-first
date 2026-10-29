@@ -1,6 +1,7 @@
 """RAG 앱 및 LLM 모델별 성능 · 속도 · 비용 비교 벤치마크 화면."""
 
 import sys
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -8,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import pandas as pd
 import streamlit as st
 
-from rag_app import benchmark_service, config
+from rag_app import benchmark_service, billing, config
 from rag_app import pipeline as rag
 from rag_app.ui_common import get_embeddings, get_store, render_sidebar, show_error
 
@@ -80,8 +81,10 @@ if run_btn and test_prompt.strip():
 
     messages_to_send = None
     search_time = 0.0
+    use_rag = "RAG 파이프라인" in bench_mode
+    bench_run_id = f"bench_{int(pd.Timestamp.now().timestamp())}_{uuid.uuid4().hex[:4]}"
 
-    if "RAG 파이프라인" in bench_mode:
+    if use_rag:
         with st.status("1단계: RAG 질문 임베딩 및 관련 문서 청크 검색 중…", expanded=True) as status:
             try:
                 embeddings = get_embeddings(settings.embedding_model, settings.embedding_dim)
@@ -92,6 +95,21 @@ if run_btn and test_prompt.strip():
                 hits = rag.search_chunks(store, q_vec, settings.top_k)
                 t_s_end = pd.Timestamp.now().timestamp()
                 search_time = max(0.001, t_s_end - t_s_start)
+
+                # 질문 임베딩 과금 기록
+                billing.record_billing_event(
+                    stage="질문 임베딩",
+                    model_id=settings.embedding_model,
+                    input_tokens=max(1, int(len(test_prompt) / 2.2)),
+                    output_tokens=0,
+                    collection_name=settings.collection,
+                    run_id=bench_run_id,
+                    prompt=test_prompt,
+                    latency_sec=round(search_time, 3),
+                    chunk_size=settings.chunk_size,
+                    chunk_overlap=settings.chunk_overlap,
+                    top_k=settings.top_k,
+                )
 
                 docs = [doc for doc, _ in hits]
                 messages_to_send = rag.build_prompt(settings.instructions, docs, test_prompt)
@@ -122,6 +140,11 @@ if run_btn and test_prompt.strip():
             messages=messages_to_send,
             search_time_sec=search_time,
             max_output_tokens=max_tokens,
+            collection_name=settings.collection if use_rag else "-",
+            run_id=bench_run_id,
+            chunk_size=settings.chunk_size if use_rag else 0,
+            chunk_overlap=settings.chunk_overlap if use_rag else 0,
+            top_k=settings.top_k if use_rag else 0,
         )
         results.append(res)
         progress_bar.progress((idx + 1) / total_models)
@@ -141,8 +164,8 @@ if run_btn and test_prompt.strip():
                 "생성 속도": f"{r.throughput:.1f} t/s",
                 "입력 토큰 (문맥포함)": f"{r.input_tokens:,}",
                 "출력 토큰": f"{r.output_tokens:,}",
-                "1회 질의 비용": f"₩{r.cost_krw:.2f}",
-                "1,000회 비용": f"₩{r.cost_1k_krw:,.0f} (${r.cost_1k_usd:.3f})",
+                "1회 질의 비용": f"₩{r.cost_krw:,.2f}",
+                "1,000회 비용": f"₩{r.cost_1k_krw:,.0f} (${r.cost_1k_usd:,.3f})",
                 "상태": "❌ 오류" if r.error else "✅ 정상",
                 "_ttft": r.ttft_sec,
                 "_total_time": r.total_time_sec,
@@ -204,7 +227,7 @@ if run_btn and test_prompt.strip():
     st.subheader("💬 모델별 실제 RAG 답변 내용")
     for r in results:
         with st.expander(
-            f"{r.model_name} (총 {r.total_time_sec}초 소요, {r.output_tokens} 토큰 생성, ₩{r.cost_krw:.2f})"
+            f"{r.model_name} (총 {r.total_time_sec:.2f}초 소요, {r.output_tokens:,} 토큰 생성, ₩{r.cost_krw:,.2f})"
         ):
             if r.error:
                 st.error(f"오류: {r.error}")

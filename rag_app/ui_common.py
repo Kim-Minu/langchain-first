@@ -73,102 +73,190 @@ def _follow_eval_doc() -> None:
     st.session_state["cfg_eval_collection"] = config.EVAL_DOCS[st.session_state["cfg_eval_doc"]].collection
 
 
-def render_sidebar(page: str = "main") -> Settings:
-    """사이드바 설정. page='eval'이면 이미지 읽기 대신 OCR 프롬프트를, 컬렉션은 평가용 이름을 보여 줌."""
-    for key, default in DEFAULTS.items():
-        st.session_state[key] = st.session_state.get(key, default)
+def render_embedding_cache_widget() -> None:
+    """왼쪽 사이드바에 PostgreSQL 임베딩 캐시 상태(활성화 여부, 캐시된 청크/질문 수)를 표출합니다."""
+    with st.container(border=True):
+        st.markdown("##### ⚡ 임베딩 캐시 상태")
+        stats = rag.get_embedding_cache_stats()
+        if stats.get("enabled"):
+            st.caption("🟢 **캐시 활성화됨** (`embedding_cache`)")
+            total = stats.get("total", 0)
+            doc_cnt = stats.get("doc_count", 0)
+            query_cnt = stats.get("query_count", 0)
+            
+            c1, c2 = st.columns(2)
+            c1.metric("문서 청크", f"{doc_cnt:,}개")
+            c2.metric("질문 벡터", f"{query_cnt:,}개")
+            st.caption(f"총 {total:,}개 임베딩 저장됨 · 재호출 $0")
 
+            if st.button("🗑️ 임베딩 캐시 비우기", key="btn_clear_embed_cache", width="stretch"):
+                deleted = rag.clear_embedding_cache()
+                st.success(f"{deleted:,}개 캐시 삭제 완료")
+                st.rerun()
+        else:
+            st.caption("⚪ **캐시 비활성화됨** (`config.EMBEDDING_CACHE=False`)")
+
+
+def render_left_menu() -> None:
+    """왼쪽 사이드바(st.sidebar): 네비게이션 메뉴, 실시간 과금 카운터 및 임베딩 캐시 상태 위젯."""
     with st.sidebar:
         # 프로젝트 공통 .streamlit/config.toml이 자동 페이지 목록을 숨기므로(web_chat.py용 showSidebarNavigation = false)
-        # 두 화면 사이 이동 링크를 직접 둠
+        # 페이지 이동 링크를 직접 배치
         st.page_link("app.py", label="PDF RAG 실습", icon="📄")
         st.page_link("pages/ocr_eval.py", label="OCR · RAG 평가", icon="🔎")
         st.page_link("pages/benchmark.py", label="LLM 성능 벤치마크", icon="⚡")
         st.page_link("pages/billing_dashboard.py", label="과금 대시보드", icon="💰")
         st.divider()
 
-        # 실시간 과금 카운터 위젯 (모든 페이지 공통)
+        # 1. 실시간 과금 카운터 위젯 (모든 페이지 공통)
         billing.render_billing_counter_widget()
-        st.divider()
 
-        st.header("설정")
-        st.caption("두 화면(PDF RAG 실습 · OCR · RAG 평가)이 같은 설정을 공유합니다.")
+        # 2. 임베딩 캐시 상태 위젯
+        render_embedding_cache_widget()
 
-        st.subheader("A. 인덱싱")
+
+def render_header_toolbar(page: str = "main") -> Settings:
+    """상단 가로 툴바: 자주 쓰는 핵심 설정(모델, top-k, 컬렉션)과 팝오버 상세 설정(청크, 임베딩, 프롬프트)."""
+    for key, default in DEFAULTS.items():
+        st.session_state[key] = st.session_state.get(key, default)
+
+    with st.container(border=True):
         if page == "eval":
-            st.selectbox(
-                "평가 문서", list(config.EVAL_DOCS), format_func=lambda key: config.EVAL_DOCS[key].label,
-                key="cfg_eval_doc", on_change=_follow_eval_doc,
-                help="고르면 PDF · 질문 세트 · 컬렉션이 함께 바뀜. 컬렉션만 다른 문서 것으로 바꾸면 "
-                     "같은 질문을 더 큰 인덱스에서 평가할 수 있음 (예: 1~20쪽 질문을 1~100쪽 컬렉션에서)",
-            )
-            st.text_area(
-                "OCR 프롬프트", key="cfg_ocr_prompt", height=220,
-                help="스캔한 페이지마다 Gemini에 이 지시와 함께 보냄. 바꾸면 OCR을 다시 실행 (결과는 프롬프트별로 캐시)",
-            )
-        else:
-            st.radio(
-                "PDF 속 이미지", list(config.IMAGE_OPTIONS), format_func=config.IMAGE_OPTIONS.get, key="cfg_image_mode",
-                help="스캔 PDF는 페이지 전체가 이미지라 끄면 텍스트가 0자. 켜면 이미지마다 Gemini(아래 B의 Gemini 모델 ID)를 한 번씩 호출",
-            )
-            if st.session_state.cfg_image_mode == config.IMAGE_GEMINI:
-                st.text_area(
-                    "이미지 읽기 프롬프트", key="cfg_image_prompt", height=200,
-                    help="이미지마다 Gemini에 이 지시와 함께 보냄. 바꾸면 다시 인덱싱해야 반영됨",
+            col_doc, col_model, col_topk, col_adv = st.columns([1.8, 2.2, 1.0, 1.0], gap="medium")
+            with col_doc:
+                st.selectbox(
+                    "📄 평가 문서", list(config.EVAL_DOCS),
+                    format_func=lambda key: config.EVAL_DOCS[key].label,
+                    key="cfg_eval_doc", on_change=_follow_eval_doc,
+                    help="고르면 PDF · 질문 세트 · 기본 컬렉션이 함께 전환됩니다.",
                 )
-        st.number_input(
-            "청크 크기 (글자)", config.CHUNK_SIZE_MIN, config.CHUNK_SIZE_MAX, step=100, key="cfg_chunk_size",
-            help="청크 하나의 최대 글자 수. 작을수록 검색이 정밀하지만 문맥이 끊기기 쉬움",
-        )
-        st.number_input(
-            "청크 겹침 (글자)", config.CHUNK_OVERLAP_MIN, config.CHUNK_OVERLAP_MAX, step=50, key="cfg_chunk_overlap",
-            help="이웃한 청크가 공유하는 글자 수. 경계에서 문장이 잘려도 앞뒤 문맥을 보존",
-        )
-        st.checkbox(
-            "페이지를 넘어 이어서 청크 나누기", key="cfg_across_pages",
-            help="페이지를 이어 붙인 뒤 나눠, 페이지 경계에서 끊긴 문장도 한 청크에 들어가게 함 (청크에 page ~ page_end 기록)",
-        )
-        st.selectbox(
-            "임베딩 모델",
-            list(config.EMBEDDING_OPTIONS),
-            format_func=config.EMBEDDING_OPTIONS.get,
-            key="cfg_embedding_model",
-            help="문서 청크와 질문을 벡터로 변환하는 모델 (Vertex AI global)",
-        )
-        st.selectbox(
-            "임베딩 차원", config.EMBEDDING_DIMENSION_OPTIONS, key="cfg_embedding_dim",
-            help="바꾸면 다시 인덱싱해야 함 (같은 컬렉션 안의 벡터는 차원이 같아야 비교 가능)",
-        )
-        collection_key = "cfg_eval_collection" if page == "eval" else "cfg_collection"
-        st.text_input("컬렉션 이름 (pgvector)", key=collection_key)
+            with col_model:
+                st.selectbox(
+                    "🤖 답변 모델", list(config.LLM_OPTIONS),
+                    format_func=config.LLM_OPTIONS.get,
+                    key="cfg_llm_choice",
+                )
+            with col_topk:
+                st.number_input(
+                    "🔎 top-k", config.TOP_K_MIN, config.TOP_K_MAX,
+                    step=1, key="cfg_top_k", help="검색할 청크 개수",
+                )
+            with col_adv:
+                st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+                with st.popover("⚙️ 상세 설정", width="stretch"):
+                    st.markdown("##### ⚙️ 평가 및 모델 상세 설정")
+                    tab_ind, tab_mod = st.tabs(["📁 인덱싱 & OCR", "💬 프롬프트 & 채점"])
+                    with tab_ind:
+                        st.text_input("컬렉션 이름 (pgvector)", key="cfg_eval_collection")
+                        st.text_area("OCR 프롬프트", key="cfg_ocr_prompt", height=150)
+                        c1, c2 = st.columns(2)
+                        c1.number_input("청크 크기 (글자)", config.CHUNK_SIZE_MIN, config.CHUNK_SIZE_MAX, step=100, key="cfg_chunk_size")
+                        c2.number_input("청크 겹침 (글자)", config.CHUNK_OVERLAP_MIN, config.CHUNK_OVERLAP_MAX, step=50, key="cfg_chunk_overlap")
+                        st.checkbox("페이지를 넘어 이어서 청크 나누기", key="cfg_across_pages")
+                        e1, e2 = st.columns(2)
+                        e1.selectbox("임베딩 모델", list(config.EMBEDDING_OPTIONS), format_func=config.EMBEDDING_OPTIONS.get, key="cfg_embedding_model")
+                        e2.selectbox("임베딩 차원", config.EMBEDDING_DIMENSION_OPTIONS, key="cfg_embedding_dim")
+                    with tab_mod:
+                        st.text_input("채점 모델 (Gemini)", key="cfg_judge_model", help="정답 채점 및 근거 충실도 판정 모델")
+                        st.number_input("출력 토큰 상한", 256, 65536, step=256, key="cfg_max_output_tokens")
+                        st.text_area("지시문 (시스템 프롬프트)", key="cfg_instructions", height=150)
+        else:
+            col_model, col_topk, col_coll, col_adv = st.columns([2.2, 0.9, 2.2, 0.9], gap="medium")
+            with col_model:
+                st.selectbox(
+                    "🤖 답변 모델", list(config.LLM_OPTIONS),
+                    format_func=config.LLM_OPTIONS.get,
+                    key="cfg_llm_choice",
+                    help="질문에 답변을 생성할 LLM 모델",
+                )
+            with col_topk:
+                st.number_input(
+                    "🔎 top-k", config.TOP_K_MIN, config.TOP_K_MAX,
+                    step=1, key="cfg_top_k", help="검색할 청크 개수",
+                )
+            with col_coll:
+                stored = rag.list_stored_collections()
+                stored_names = [c["name"] for c in stored]
+                current = st.session_state.get("cfg_collection", config.COLLECTION_NAME)
 
-        st.subheader("B. 질문 · 답변")
-        st.slider("검색할 청크 수 (top-k)", config.TOP_K_MIN, config.TOP_K_MAX, key="cfg_top_k")
-        st.radio(
-            "답변 모델", list(config.LLM_OPTIONS), format_func=config.LLM_OPTIONS.get, captions=config.LLM_CAPTIONS,
-            key="cfg_llm_choice",
-        )
-        selected_choice = st.session_state.get("cfg_llm_choice")
-        selected_id = {
-            config.LLM_DEEPSEEK_FLASH: config.DEEPSEEK_FLASH_MODEL,
-            config.LLM_GEMMA_26B: config.GEMMA_26B_MODEL,
-            config.LLM_GEMINI_FLASH_LITE: config.GEMINI_FLASH_LITE_MODEL,
-            config.LLM_CLAUDE_HAIKU: config.CLAUDE_HAIKU_MODEL,
-            config.LLM_GEMINI: config.LLM_MODEL,
-            config.LLM_OLLAMA_GEMMA: config.OLLAMA_MODEL,
-        }.get(selected_choice, "")
-        if selected_id:
-            st.caption(f"호출 모델 식별자: `{selected_id}`")
-        st.number_input("출력 토큰 상한", 256, 65536, step=256, key="cfg_max_output_tokens")
-        st.text_area("지시문 (시스템 프롬프트)", key="cfg_instructions", height=200)
-        if page == "eval":
-            st.subheader("C. 채점")
-            st.text_input(
-                "채점 모델 (Gemini)", key="cfg_judge_model",
-                help="정답 채점 · 근거 충실도 판정에 사용. 답변 모델과 같으면 자기 답에 후한 편향이 생길 수 있어 다른 모델 권장",
-            )
+                chunk_map = {c["name"]: c["stored_chunks"] for c in stored}
+                file_map = {c["name"]: c["file_name"] for c in stored}
+
+                if not stored_names:
+                    st.text_input(
+                        "📚 컬렉션 (pgvector)",
+                        key="cfg_collection",
+                        help="청크가 저장된 PostgreSQL pgvector 컬렉션명",
+                    )
+                else:
+                    options = list(stored_names)
+                    if current and current not in options and current != "➕ 직접 입력...":
+                        options.insert(0, current)
+                    options.append("➕ 직접 입력...")
+
+                    def fmt_coll(name: str) -> str:
+                        if name == "➕ 직접 입력...":
+                            return "➕ 직접 입력..."
+                        cnt = chunk_map.get(name)
+                        cnt_str = f" ({cnt}개)" if cnt is not None else ""
+                        fname = file_map.get(name)
+                        fn_str = f" · {fname}" if fname else ""
+                        return f"🗂️ {name}{cnt_str}{fn_str}"
+
+                    default_idx = options.index(current) if current in options else 0
+                    selected = st.selectbox(
+                        "📚 컬렉션 (pgvector)",
+                        options,
+                        index=default_idx,
+                        format_func=fmt_coll,
+                        help="청크가 저장된 PostgreSQL pgvector 컬렉션을 선택합니다.",
+                    )
+                    if selected == "➕ 직접 입력...":
+                        custom_name = st.text_input(
+                            "신규 컬렉션 이름",
+                            value="" if current in stored_names or current == "➕ 직접 입력..." else current,
+                            placeholder="예: doc_report_c500_o50_d1536",
+                        )
+                        if custom_name.strip():
+                            st.session_state["cfg_collection"] = custom_name.strip()
+                    else:
+                        st.session_state["cfg_collection"] = selected
+            with col_adv:
+                st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+                with st.popover("⚙️ 상세 설정", width="stretch"):
+                    st.markdown("##### ⚙️ 파이프라인 상세 설정")
+                    tab_ind, tab_mod = st.tabs(["📁 인덱싱 (청크 · 임베딩)", "💬 답변 & 프롬프트"])
+                    with tab_ind:
+                        st.radio(
+                            "PDF 속 이미지 처리", list(config.IMAGE_OPTIONS),
+                            format_func=config.IMAGE_OPTIONS.get, key="cfg_image_mode",
+                        )
+                        if st.session_state.cfg_image_mode == config.IMAGE_GEMINI:
+                            st.text_area("이미지 읽기 프롬프트", key="cfg_image_prompt", height=120)
+                        c1, c2 = st.columns(2)
+                        c1.number_input("청크 크기 (글자)", config.CHUNK_SIZE_MIN, config.CHUNK_SIZE_MAX, step=100, key="cfg_chunk_size")
+                        c2.number_input("청크 겹침 (글자)", config.CHUNK_OVERLAP_MIN, config.CHUNK_OVERLAP_MAX, step=50, key="cfg_chunk_overlap")
+                        st.checkbox("페이지를 넘어 이어서 청크 나누기", key="cfg_across_pages")
+                        e1, e2 = st.columns(2)
+                        e1.selectbox("임베딩 모델", list(config.EMBEDDING_OPTIONS), format_func=config.EMBEDDING_OPTIONS.get, key="cfg_embedding_model")
+                        e2.selectbox("임베딩 차원", config.EMBEDDING_DIMENSION_OPTIONS, key="cfg_embedding_dim")
+                    with tab_mod:
+                        selected_choice = st.session_state.get("cfg_llm_choice")
+                        selected_id = {
+                            config.LLM_DEEPSEEK_FLASH: config.DEEPSEEK_FLASH_MODEL,
+                            config.LLM_GEMMA_26B: config.GEMMA_26B_MODEL,
+                            config.LLM_GEMINI_FLASH_LITE: config.GEMINI_FLASH_LITE_MODEL,
+                            config.LLM_CLAUDE_HAIKU: config.CLAUDE_HAIKU_MODEL,
+                            config.LLM_GEMINI: config.LLM_MODEL,
+                            config.LLM_OLLAMA_GEMMA: config.OLLAMA_MODEL,
+                        }.get(selected_choice, "")
+                        if selected_id:
+                            st.caption(f"호출 모델 식별자: `{selected_id}`")
+                        st.number_input("출력 토큰 상한", 256, 65536, step=256, key="cfg_max_output_tokens")
+                        st.text_area("지시문 (시스템 프롬프트)", key="cfg_instructions", height=150)
 
     s = st.session_state
+    collection_key = "cfg_eval_collection" if page == "eval" else "cfg_collection"
     settings = Settings(
         image_mode=s.cfg_image_mode,
         # 비우면 기본 프롬프트 사용 (빈 지시로 호출하면 결과가 들쭉날쭉해짐)
@@ -189,8 +277,40 @@ def render_sidebar(page: str = "main") -> Settings:
         eval_doc=s.cfg_eval_doc,
     )
     if not settings.chunk_ok:
-        st.sidebar.error("청크 겹침은 청크 크기보다 작아야 합니다.")
+        st.error("청크 겹침은 청크 크기보다 작아야 합니다.")
     return settings
+
+
+def render_settings_panel(container=None, page: str = "main") -> Settings:
+    """하위 호환성을 위해 유지: render_header_toolbar로 위임."""
+    return render_header_toolbar(page=page)
+
+
+def render_sidebar(page: str = "main", settings_container=None) -> Settings:
+    """왼쪽 사이드바 메뉴 렌더링 및 설정 반환."""
+    render_left_menu()
+    for key, default in DEFAULTS.items():
+        st.session_state[key] = st.session_state.get(key, default)
+    s = st.session_state
+    collection_key = "cfg_eval_collection" if page == "eval" else "cfg_collection"
+    return Settings(
+        image_mode=s.cfg_image_mode,
+        image_prompt=(s.cfg_image_prompt.strip() or config.IMAGE_PROMPT) if s.cfg_image_mode == config.IMAGE_GEMINI else None,
+        ocr_prompt=s.cfg_ocr_prompt.strip() or config.OCR_PROMPT,
+        chunk_size=s.cfg_chunk_size,
+        chunk_overlap=s.cfg_chunk_overlap,
+        across_pages=s.cfg_across_pages,
+        embedding_model=s.cfg_embedding_model,
+        embedding_dim=s.cfg_embedding_dim,
+        collection=s[collection_key],
+        top_k=s.cfg_top_k,
+        llm_choice=s.cfg_llm_choice,
+        llm_model=s.cfg_llm_model,
+        max_output_tokens=s.cfg_max_output_tokens,
+        instructions=s.cfg_instructions,
+        judge_model=s.cfg_judge_model,
+        eval_doc=s.cfg_eval_doc,
+    )
 
 
 @st.cache_resource(show_spinner=False)

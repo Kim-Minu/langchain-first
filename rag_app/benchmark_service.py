@@ -1,6 +1,7 @@
 """RAG 앱 및 LLM 모델별 성능(지연 시간, 속도, 토큰 수, 비용) 측정 서비스."""
 
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Callable, Generator
 
@@ -59,7 +60,11 @@ def get_model_identifier(choice: str) -> str:
         config.LLM_GEMINI: config.LLM_MODEL,
         config.LLM_OLLAMA_GEMMA: config.OLLAMA_MODEL,
     }
-    return mapping.get(choice, config.LLM_MODEL)
+    if choice in mapping:
+        return mapping[choice]
+    if choice in config.MODEL_PRICING:
+        return choice
+    return config.LLM_MODEL
 
 
 def calculate_cost(model_id_or_key: str, input_tokens: int, output_tokens: int) -> dict[str, float]:
@@ -87,6 +92,11 @@ def run_single_benchmark(
     search_time_sec: float = 0.0,
     max_output_tokens: int = 1024,
     on_chunk: Callable[[str], None] | None = None,
+    collection_name: str | None = None,
+    run_id: str | None = None,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
+    top_k: int | None = None,
 ) -> BenchmarkResult:
     """단일 모델에 대해 스트리밍으로 호출하여 지연시간, 처리량, 토큰수, 비용을 측정합니다."""
     model_id = get_model_identifier(choice)
@@ -162,6 +172,15 @@ def run_single_benchmark(
             model_id=model_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            collection_name=collection_name,
+            run_id=run_id or "",
+            prompt=str(prompt_preview),
+            latency_sec=round(gen_time, 3),
+            ttft_sec=round(ttft, 3),
+            throughput=round(throughput, 1),
+            chunk_size=chunk_size or 0,
+            chunk_overlap=chunk_overlap or 0,
+            top_k=top_k or 0,
         )
 
     return BenchmarkResult(
@@ -192,13 +211,36 @@ def run_rag_benchmark(
     top_k: int = 4,
     models: list[str] | None = None,
     max_output_tokens: int = 1024,
+    collection_name: str | None = None,
+    chunk_size: int = 0,
+    chunk_overlap: int = 0,
+    run_id: str | None = None,
 ) -> RagBenchmarkSummary:
     """RAG 파이프라인(질문 임베딩 -> 청크 검색 -> 프롬프트 빌드 -> 모델별 생성) 전체 성능을 실측합니다."""
+    coll = collection_name or getattr(store, "collection_name", None) or "-"
+    bench_run_id = run_id or f"bench_{int(time.time())}_{uuid.uuid4().hex[:6]}"
     t_search_start = time.perf_counter()
     query_vector = rag.embed_question(embeddings, question)
-    hits = rag.search_chunks(store, query_vector, top_k)
     t_search_end = time.perf_counter()
     search_time = max(0.001, t_search_end - t_search_start)
+
+    # 질문 임베딩 과금 기록
+    emb_model = getattr(embeddings, "model_name", None) or getattr(embeddings, "model", "gemini-embedding-2")
+    billing.record_billing_event(
+        stage="질문 임베딩",
+        model_id=emb_model,
+        input_tokens=max(1, int(len(question) / 2.2)),
+        output_tokens=0,
+        collection_name=coll,
+        run_id=bench_run_id,
+        prompt=question,
+        latency_sec=round(search_time, 3),
+        top_k=top_k,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+
+    hits = rag.search_chunks(store, query_vector, top_k)
 
     docs = [doc for doc, _ in hits]
     messages = rag.build_prompt(instructions, docs, question)
@@ -219,6 +261,11 @@ def run_rag_benchmark(
             messages=messages,
             search_time_sec=search_time,
             max_output_tokens=max_output_tokens,
+            collection_name=coll,
+            run_id=bench_run_id,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            top_k=top_k,
         )
         results.append(res)
 

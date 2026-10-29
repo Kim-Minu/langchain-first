@@ -19,6 +19,7 @@ B. 질문에 답하기 (런타임): 질문 입력 → 관련 청크 검색 → �
 
 import sys
 import time
+import uuid
 from pathlib import Path
 
 # streamlit run은 스크립트 폴더(rag_app/)만 import 경로에 넣으므로 프로젝트 루트를 추가
@@ -35,15 +36,22 @@ from rag_app.ui_common import (
     get_llm,
     get_store,
     preview,
-    render_sidebar,
+    render_header_toolbar,
+    render_left_menu,
     show_error,
     step_header,
 )
 
 st.set_page_config(page_title="PDF RAG 실습", page_icon="📄", layout="wide")
 
+# 왼쪽 사이드바: 네비게이션 메뉴 및 실시간 과금 카운터 위젯
+render_left_menu()
 
-settings = render_sidebar()
+st.title("📄 PDF RAG 실습")
+
+# 상단 툴바: 빠른 설정(답변 모델, top-k, 컬렉션) 및 팝오버 상세 설정
+settings = render_header_toolbar(page="main")
+
 # 아래 코드가 쓰는 이름으로 풀어 둠
 image_mode, image_prompt = settings.image_mode, settings.image_prompt
 chunk_size, chunk_overlap, across_pages = settings.chunk_size, settings.chunk_overlap, settings.across_pages
@@ -52,9 +60,17 @@ top_k, llm_choice, llm_model = settings.top_k, settings.llm_choice, settings.llm
 max_output_tokens, instructions = settings.max_output_tokens, settings.instructions
 chunk_settings_ok, answer_model = settings.chunk_ok, settings.answer_model
 
+st.caption(
+    "LangChain으로 구성한 RAG 파이프라인을 단계별로 실행하고 각 단계의 출력값을 확인합니다. "
+    f"임베딩 `{embedding_model}` · 답변 `{answer_model}` · 벡터 스토어 PostgreSQL(pgvector) `{collection_name}`"
+)
 
-def run_index_steps(result: dict, data: bytes, file_name: str, index_info: dict) -> None:
+
+def run_index_steps(
+    result: dict, data: bytes, file_name: str, index_info: dict, target_coll: str | None = None
+) -> None:
     """A-1 ~ A-4를 차례로 실행하며 단계 결과를 result에 쌓음 (중간에 실패해도 그 전 단계 결과는 화면에 남음)."""
+    active_coll = target_coll or collection_name
     use_images = image_mode == config.IMAGE_GEMINI
     st.write("1) 문서 읽기" + (f" (이미지는 {llm_model}로 변환 — 이미지가 많으면 오래 걸림)" if use_images else ""))
     # 실패 기록(failures)이 이전 인덱싱과 섞이지 않게 매번 새로 만듦 (LLM 객체는 캐시 재사용)
@@ -74,6 +90,9 @@ def run_index_steps(result: dict, data: bytes, file_name: str, index_info: dict)
                 model_id=llm_model,
                 input_tokens=img_count * 258,
                 output_tokens=img_count * 300,
+                collection_name=active_coll,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
             )
 
     st.write("2) 청크로 나누기")
@@ -88,8 +107,19 @@ def run_index_steps(result: dict, data: bytes, file_name: str, index_info: dict)
     embeddings = get_embeddings(embedding_model, embedding_dim)
     result["vectors"], result["embedding_cache_hits"] = rag.embed_chunks(embeddings, result["chunks"])
 
-    # 과금 카운터: 신규 임베딩(캐시 미적용분) 과금 기록
-    api_chunks = len(result["chunks"]) - result.get("embedding_cache_hits", 0)
+    # 과금 카운터: 신규 임베딩(캐시 미적용분) 및 캐시 절감 과금 기록
+    cache_hits = result.get("embedding_cache_hits", 0)
+    total_chunks = len(result["chunks"])
+    api_chunks = total_chunks - cache_hits
+    pricing = billing.get_model_pricing(embedding_model)
+
+    cached_tokens = 0
+    saved_cost = 0.0
+    if cache_hits > 0:
+        cached_chars = sum(len(c.page_content) for c in result["chunks"][api_chunks:])
+        cached_tokens = max(1, int(cached_chars / 2.2))
+        saved_cost = (cached_tokens / 1_000_000.0) * pricing["input_per_1m"] * billing.EXCHANGE_RATE_KRW
+
     if api_chunks > 0:
         total_chars = sum(len(c.page_content) for c in result["chunks"][:api_chunks])
         in_tokens = max(1, int(total_chars / 2.2))
@@ -98,20 +128,35 @@ def run_index_steps(result: dict, data: bytes, file_name: str, index_info: dict)
             model_id=embedding_model,
             input_tokens=in_tokens,
             output_tokens=0,
+            collection_name=active_coll,
+            cache_hit=cache_hits > 0,
+            cache_hit_count=cache_hits,
+            cached_tokens=cached_tokens,
+            saved_cost_krw=saved_cost,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+    elif cache_hits > 0:
+        billing.record_billing_event(
+            stage="문서 청크 임베딩",
+            model_id=embedding_model,
+            input_tokens=0,
+            output_tokens=0,
+            collection_name=active_coll,
+            cache_hit=True,
+            cache_hit_count=cache_hits,
+            cached_tokens=cached_tokens,
+            saved_cost_krw=saved_cost,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
         )
     st.write("4) 벡터 스토어 저장")
-    store = get_store(embedding_model, embedding_dim, collection_name)
+    store = get_store(embedding_model, embedding_dim, active_coll)
     result["ids"] = rag.save_to_store(
         store, result["chunks"], result["vectors"],
         {**index_info, "image_failures": len(result["image_failures"])},
     )
 
-
-st.title("📄 PDF RAG 실습")
-st.caption(
-    "LangChain으로 구성한 RAG 파이프라인을 단계별로 실행하고 각 단계의 출력값을 확인합니다. "
-    f"임베딩 `{embedding_model}` · 답변 `{answer_model}` · 벡터 스토어 PostgreSQL(pgvector) `{collection_name}`"
-)
 
 tab_index, tab_query = st.tabs(["A. 미리 준비하기 (인덱싱)", "B. 질문에 답하기 (런타임)"])
 
@@ -121,6 +166,37 @@ tab_index, tab_query = st.tabs(["A. 미리 준비하기 (인덱싱)", "B. 질문
 with tab_index:
     st.info("자료를 등록하거나 변경할 때 한 번 실행합니다. 결과는 PostgreSQL에 저장되어 앱을 다시 켜도 남습니다.")
     uploaded = st.file_uploader("PDF 파일", type=["pdf"], accept_multiple_files=False)
+
+    # 업로드된 파일명 및 현재 청크/임베딩 설정 기반 추천 컬렉션명 자동 생성
+    if uploaded is not None:
+        suggested_name = rag.build_collection_name(
+            uploaded.name, chunk_size, chunk_overlap, embedding_dim, image_mode
+        )
+    else:
+        suggested_name = collection_name
+
+    coll_c1, coll_c2 = st.columns([3, 1])
+    with coll_c1:
+        target_collection = st.text_input(
+            "📚 저장할 컬렉션 이름 (고유 식별자)",
+            value=suggested_name,
+            help="파일명과 청크/임베딩 설정으로 자동 추천된 고유 컬렉션명입니다. 필요시 직접 수정할 수 있습니다.",
+            key="_target_coll_input",
+        )
+    with coll_c2:
+        st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+        if st.button("🔄 추천 이름 새로고침", width="stretch", help="현재 설정값으로 컬렉션명을 다시 생성합니다"):
+            st.session_state["_target_coll_input"] = suggested_name
+            st.rerun()
+
+    existing_info = rag.get_collection_info(target_collection)
+    if existing_info and existing_info.get("stored_chunks", 0) > 0:
+        st.caption(
+            f"⚠️ 이미 `{target_collection}` 컬렉션이 DB에 존재합니다 "
+            f"({existing_info['stored_chunks']}개 청크 저장됨). 인덱싱을 실행하면 기존 청크를 새 내용으로 교체합니다."
+        )
+    else:
+        st.caption(f"✨ 새로운 컬렉션 `{target_collection}`으로 PostgreSQL에 독립 저장됩니다.")
 
     # 저장 결과를 바꾸는 설정 — 파일 내용 해시와 합쳐 "같은 문서" 판단 키가 됨
     content_settings = {
@@ -133,7 +209,7 @@ with tab_index:
         "embedding_model": embedding_model,
         "embedding_dim": embedding_dim,
     }
-    index_settings = {"file": uploaded.name if uploaded else None, "collection": collection_name, **content_settings}
+    index_settings = {"file": uploaded.name if uploaded else None, "collection": target_collection, **content_settings}
 
     force_reindex = st.checkbox(
         "같은 문서여도 다시 인덱싱",
@@ -153,7 +229,7 @@ with tab_index:
                 data = uploaded.getvalue()
                 file_hash = rag.file_sha256(data)
                 index_key = rag.make_index_key(file_hash, content_settings)
-                same = None if force_reindex else rag.find_same_index(collection_name, index_key)
+                same = None if force_reindex else rag.find_same_index(target_collection, index_key)
                 if same:
                     result["skipped"] = same
                     status.update(label="이미 인덱싱된 문서 — 건너뜀", state="complete", expanded=False)
@@ -166,8 +242,10 @@ with tab_index:
                             "file_name": uploaded.name,
                             "settings": content_settings,
                         },
+                        target_coll=target_collection,
                     )
                     status.update(label="인덱싱 완료", state="complete", expanded=False)
+                st.session_state["cfg_collection"] = target_collection
             except Exception as e:
                 status.update(label="인덱싱 실패", state="error")
                 show_error("인덱싱", e)
@@ -302,6 +380,27 @@ with tab_index:
             except Exception as e:
                 show_error("저장 결과 조회", e)
 
+    st.divider()
+    stored_colls = rag.list_stored_collections()
+    with st.expander(f"🗂️ PostgreSQL 컬렉션 목록 및 삭제 관리 ({len(stored_colls)}개)", expanded=False):
+        if not stored_colls:
+            st.caption("저장된 컬렉션이 없습니다.")
+        else:
+            st.caption("현재 PostgreSQL(pgvector)에 저장된 모든 컬렉션입니다. 불필요한 컬렉션을 삭제할 수 있습니다.")
+            for c in stored_colls:
+                c_row1, c_row2 = st.columns([4, 1])
+                with c_row1:
+                    fname = c.get("file_name") or "-"
+                    c_date = c.get("indexed_at") or "-"
+                    st.markdown(f"**`{c['name']}`** — 청크 **{c['stored_chunks']}**개 | 원본: `{fname}` | `{c_date}`")
+                with c_row2:
+                    if st.button("🗑️ 삭제", key=f"btn_del_coll_{c['name']}", width="stretch"):
+                        if rag.delete_stored_collection(c["name"]):
+                            st.success(f"`{c['name']}` 삭제 완료")
+                            if st.session_state.get("cfg_collection") == c["name"]:
+                                st.session_state["cfg_collection"] = config.COLLECTION_NAME
+                            st.rerun()
+
 # ---------------------------------------------------------------------------
 # B. 질문에 답하기 (런타임)
 # ---------------------------------------------------------------------------
@@ -329,7 +428,8 @@ with tab_query:
         asked = st.form_submit_button("질문하기", type="primary", disabled=stored_total == 0)
 
     if asked and question.strip():
-        qa: dict = {"question": question.strip(), "k": top_k, "answer_model": answer_model}
+        run_id = f"rag_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        qa: dict = {"question": question.strip(), "k": top_k, "answer_model": answer_model, "run_id": run_id}
         st.session_state.pop("qa_result", None)
         st.session_state.pop("compare_results", None)
         with st.status("답변 생성 중…", expanded=True) as status:
@@ -347,6 +447,13 @@ with tab_query:
                     model_id=embedding_model,
                     input_tokens=max(1, int(len(qa["question"]) / 2.2)),
                     output_tokens=0,
+                    collection_name=collection_name,
+                    run_id=run_id,
+                    prompt=qa["question"],
+                    latency_sec=round(t2 - t1, 3),
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    top_k=top_k,
                 )
 
                 st.write("2) 관련 청크 검색")
@@ -366,11 +473,21 @@ with tab_query:
                 usage = getattr(qa["answer"], "usage_metadata", None) or {}
                 in_tok = usage.get("input_tokens") or benchmark_service.estimate_tokens(" ".join(str(m.content) for m in qa["messages"]))
                 out_tok = usage.get("output_tokens") or benchmark_service.estimate_tokens(getattr(qa["answer"], "text", ""))
+                llm_sec = max(0.001, t5 - t4)
+                throughput = (out_tok / llm_sec) if out_tok > 0 else 0.0
                 billing.record_billing_event(
                     stage="RAG LLM 답변",
                     model_id=answer_model,
                     input_tokens=in_tok,
                     output_tokens=out_tok,
+                    collection_name=collection_name,
+                    run_id=run_id,
+                    prompt=qa["question"],
+                    latency_sec=round(llm_sec, 3),
+                    throughput=round(throughput, 1),
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    top_k=top_k,
                 )
 
                 qa["perf"] = {
@@ -461,8 +578,8 @@ with tab_query:
             )
             c4.metric(
                 "1회 질의 비용",
-                f"₩{costs['cost_krw']:.2f}",
-                help=f"${costs['cost_usd']:.5f} (1,000회 질의 시 약 ${costs['cost_1k_usd']:.3f} / ₩{costs['cost_1k_krw']:,.0f})",
+                f"₩{costs['cost_krw']:,.2f}",
+                help=f"${costs['cost_usd']:,.5f} (1,000회 질의 시 약 ${costs['cost_1k_usd']:,.3f} / ₩{costs['cost_1k_krw']:,.0f})",
             )
 
             with st.expander("⚡ 이 검색 결과(동일 문서 청크)로 다른 모델들과 RAG 답변 성능 비교"):
@@ -484,6 +601,11 @@ with tab_query:
                                 messages=qa["messages"],
                                 search_time_sec=retrieval_sec,
                                 max_output_tokens=max_output_tokens,
+                                collection_name=collection_name,
+                                run_id=qa.get("run_id", ""),
+                                chunk_size=chunk_size,
+                                chunk_overlap=chunk_overlap,
+                                top_k=top_k,
                             )
                             compare_results.append(r)
                         st.session_state["compare_results"] = compare_results
@@ -498,8 +620,8 @@ with tab_query:
                             "전체 시간": f"{cr.total_time_sec:.2f}초",
                             "생성 속도": f"{cr.throughput:.1f} t/s",
                             "입력/출력 토큰": f"{cr.input_tokens:,} / {cr.output_tokens:,}",
-                            "1회 예상 비용": f"₩{cr.cost_krw:.2f}",
-                            "1,000회 비용": f"₩{cr.cost_1k_krw:,.0f} (${cr.cost_1k_usd:.3f})",
+                            "1회 예상 비용": f"₩{cr.cost_krw:,.2f}",
+                            "1,000회 비용": f"₩{cr.cost_1k_krw:,.0f} (${cr.cost_1k_usd:,.3f})",
                             "상태": "❌ 오류" if cr.error else "✅ 정상",
                         })
                     st.dataframe(pd.DataFrame(c_rows), width="stretch")

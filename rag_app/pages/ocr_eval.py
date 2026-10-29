@@ -22,7 +22,7 @@ import pandas as pd
 import pypdf
 import streamlit as st
 
-from rag_app import config
+from rag_app import billing, config
 from rag_app import evaluation as ev
 from rag_app import pipeline as rag
 from rag_app.ui_common import (
@@ -30,17 +30,31 @@ from rag_app.ui_common import (
     get_llm,
     get_store,
     preview,
-    render_sidebar,
+    render_header_toolbar,
+    render_left_menu,
     show_error,
     step_header,
 )
 
 st.set_page_config(page_title="OCR · RAG 평가", page_icon="🔎", layout="wide")
-settings = render_sidebar("eval")
+
+# 왼쪽 사이드바: 네비게이션 메뉴 및 실시간 과금 카운터 위젯
+render_left_menu()
+
+st.title("🔎 OCR · RAG 평가")
+
+# 상단 툴바: 빠른 설정(평가 문서, 답변 모델, top-k) 및 팝오버 상세 설정
+settings = render_header_toolbar(page="eval")
+
 doc = config.EVAL_DOCS[settings.eval_doc]
 QA_KEY = f"eval_qa_{settings.eval_doc}"  # 문서마다 질문 세트를 따로 보관
 
 VERDICT_MARK = {"correct": "✅ 정답", "partial": "🟡 부분", "incorrect": "❌ 오답", "error": "⚠️ 오류"}
+
+st.caption(
+    "스캔 PDF를 Gemini OCR로 읽어 인덱싱하고, 질문 · 정답 세트로 RAG 답변이 잘 나오는지 측정합니다. "
+    f"{doc.label} · OCR `{settings.llm_model}` · 답변 `{settings.answer_model}` · 채점 `{settings.judge_model}` · 컬렉션 `{settings.collection}`"
+)
 
 
 @st.cache_data(show_spinner=False, max_entries=40)
@@ -57,12 +71,6 @@ def run_label(question_set: str) -> str:
         f" · 채점 {settings.judge_model} · {question_set}"
     )
 
-
-st.title("🔎 OCR · RAG 평가")
-st.caption(
-    "스캔 PDF를 Gemini OCR로 읽어 인덱싱하고, 질문 · 정답 세트로 RAG 답변이 잘 나오는지 측정합니다. "
-    f"{doc.label} · OCR `{settings.llm_model}` · 답변 `{settings.answer_model}` · 채점 `{settings.judge_model}` · 컬렉션 `{settings.collection}`"
-)
 
 tab_ocr, tab_qa, tab_eval, tab_compare = st.tabs(["1. OCR · 인덱싱", "2. 질문 · 정답", "3. RAG 평가", "4. 실행 비교"])
 
@@ -103,6 +111,15 @@ with tab_ocr:
                     "pages": pages, "failures": failures, "cached": cached,
                 }
                 status.update(label=f"OCR 완료 (캐시 {cached}쪽 · 새로 OCR {len(pages) - cached}쪽)", state="complete", expanded=False)
+                new_ocr = len(pages) - cached
+                if new_ocr > 0:
+                    billing.record_billing_event(
+                        stage="문서 이미지 읽기 (OCR)",
+                        model_id=settings.llm_model,
+                        input_tokens=new_ocr * 258,
+                        output_tokens=new_ocr * 300,
+                        collection_name=settings.collection,
+                    )
             except Exception as e:
                 status.update(label="OCR 실패", state="error")
                 show_error("OCR", e)
@@ -166,6 +183,37 @@ with tab_ocr:
                         chunks = rag.split_documents(pages, settings.chunk_size, settings.chunk_overlap, settings.across_pages)
                         store = get_store(settings.embedding_model, settings.embedding_dim, settings.collection)
                         vectors, cache_hits = rag.embed_chunks(store.embeddings, chunks)
+                        # 과금 카운터: 신규 임베딩(캐시 미적용분) 과금 기록
+                        api_chunks = len(chunks) - cache_hits
+                        if api_chunks > 0:
+                            total_chars = sum(len(c.page_content) for c in chunks[:api_chunks])
+                            in_tokens = max(1, int(total_chars / 2.2))
+                            billing.record_billing_event(
+                                stage="문서 청크 임베딩",
+                                model_id=settings.embedding_model,
+                                input_tokens=in_tokens,
+                                output_tokens=0,
+                                collection_name=settings.collection,
+                                chunk_size=settings.chunk_size,
+                                chunk_overlap=settings.chunk_overlap,
+                            )
+                        if cache_hits > 0:
+                            cached_chars = sum(len(c.page_content) for c in chunks[api_chunks:])
+                            cached_tokens = max(1, int(cached_chars / 2.2))
+                            saved_cost = billing.calculate_billing_cost(settings.embedding_model, cached_tokens, 0)
+                            billing.record_billing_event(
+                                stage="문서 청크 임베딩 (캐시 적중)",
+                                model_id=settings.embedding_model,
+                                input_tokens=0,
+                                output_tokens=0,
+                                collection_name=settings.collection,
+                                cache_hit=True,
+                                cache_hit_count=cache_hits,
+                                cached_tokens=cached_tokens,
+                                saved_cost_krw=saved_cost["cost_krw"],
+                                chunk_size=settings.chunk_size,
+                                chunk_overlap=settings.chunk_overlap,
+                            )
                         rag.save_to_store(
                             store, chunks, vectors,
                             {"index_key": index_key, "file_sha256": ocr["sha"], "file_name": ocr["file_name"],
@@ -267,6 +315,8 @@ with tab_eval:
                 settings.top_k,
                 use_paraphrase=question_set == "사용자 말투 질문",
                 on_done=lambda done, r: progress.progress(done / len(items), text=f"{done}/{len(items)} · {r.id}번 {VERDICT_MARK[r.verdict]}"),
+                chunk_size=settings.chunk_size,
+                chunk_overlap=settings.chunk_overlap,
             )
             run = {"label": run_label(question_set), "summary": ev.summarize(results), "results": results,
                    "settings": {"chunk_size": settings.chunk_size, "chunk_overlap": settings.chunk_overlap,

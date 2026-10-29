@@ -23,25 +23,25 @@ uv sync
 | `GCP_API_KEY` | `first_ex1.py`, `third.py`, `news_agent.py` | Vertex AI용 API 키 |
 | `GOOGLE_CLOUD_LOCATION` | 위와 동일 | Vertex AI 리전 (기본값 `us-central1`) |
 | `GOOGLE_API_KEY` | `main.py` | Gemini API 키 (`init_chat_model`의 `google-genai` 공급자) |
-| `SEARCH_CACHE_TTL_SECONDS` | `web_chat.py` | Vertex AI Grounding 답변 캐시 유효 시간(초, 기본 `600`, `0`이면 끔). LangGraph `BaseCache`(PostgreSQL) + `wrap_model_call` 미들웨어 |
-| `MAX_OUTPUT_TOKENS` | `web_chat.py` | 출력 토큰 상한의 기본값 (기본 `8192`, 화면의 모델 메뉴에서 조정 가능 · Gemini는 추론 토큰 포함) |
-| `DATABASE_URL` | `web_chat.py` | 대화 내역 저장용 PostgreSQL (기본값: `docker-compose.yml`의 로컬 DB `localhost:5433`) |
+| `SEARCH_CACHE_TTL_SECONDS` | `chat_app/web_chat.py` | Vertex AI Grounding 답변 캐시 유효 시간(초, 기본 `600`, `0`이면 끔). LangGraph `BaseCache`(PostgreSQL) + `wrap_model_call` 미들웨어 |
+| `MAX_OUTPUT_TOKENS` | `chat_app/web_chat.py` | 출력 토큰 상한의 기본값 (기본 `8192`, 화면의 모델 메뉴에서 조정 가능 · Gemini는 추론 토큰 포함) |
+| `DATABASE_URL` | `chat_app/web_chat.py` | 대화 내역 저장용 PostgreSQL (기본값: `docker-compose.yml`의 로컬 DB `localhost:5433`) |
 
 예제 코드는 `.env`를 자동으로 읽지 않으므로(`load_dotenv` 주석 처리) 셸에서 직접 export 하거나 uv의 `--env-file` 옵션을 사용합니다.
 
 ```bash
 export GCP_API_KEY=...
 # 또는
-uv run --env-file .env python news_agent.py
+uv run --env-file .env python exercises/news_agent.py
 ```
 
-### 웹 챗봇 (web_chat.py) 실행
+### 웹 챗봇 (`chat_app/web_chat.py`) 실행
 
 대화 내역을 PostgreSQL에 저장하므로 DB를 먼저 띄웁니다.
 
 ```bash
 docker compose up -d                 # 로컬 PostgreSQL (127.0.0.1:5433)
-uv run streamlit run web_chat.py
+uv run streamlit run chat_app/web_chat.py
 ```
 
 - 에이전트 대화 기억: `PostgresSaver` 체크포인터 (`checkpoints*` 테이블)
@@ -62,10 +62,18 @@ uv run streamlit run rag_app/app.py
 
 | 화면 | 파일 | 내용 |
 | --- | --- | --- |
-| PDF RAG 실습 | `rag_app/app.py` | PDF 업로드 → 인덱싱 4단계 · 질문 4단계의 출력값 확인, 답변 모델 Gemini / Ollama Gemma 선택, 스캔 PDF는 Gemini 이미지 읽기 |
-| OCR · RAG 평가 | `rag_app/pages/ocr_eval.py` | 스캔 PDF를 Gemini OCR(사진 · 그림 제외)로 읽어 인덱싱 → 질문 · 정답 세트로 정답률 · 검색 순위 측정 → 설정별 비교 |
+| PDF RAG 실습 | `rag_app/app.py` | PDF 업로드 → 인덱싱 4단계 · 질문 4단계의 단계별 출력 확인, DeepSeek / Gemma / Gemini / Claude Haiku / Ollama 지원 |
+| OCR · RAG 평가 | `rag_app/pages/ocr_eval.py` | 스캔 PDF를 Gemini OCR로 읽어 인덱싱 → 질문 · 정답 세트로 정답률 · 검색 순위 측정 → 설정별 비교 |
+| LLM 성능 벤치마크 | `rag_app/pages/benchmark.py` | RAG 및 단독 질의 환경에서 5대 모델의 TTFT, 처리속도(t/s), 1회 예상 비용 실측 비교 |
+| 과금 대시보드 | `rag_app/pages/billing_dashboard.py` | Google Cloud Model Garden 공식 단가 기준 PostgreSQL 영구 저장 실시간 과금 추적 |
 
-두 화면은 같은 사이드바 설정을 공유하며, 사이드바 맨 위의 **📄 PDF RAG 실습 · 🔎 OCR · RAG 평가** 링크로 전환합니다 (주소로 바로 열기: `http://localhost:8501/ocr_eval`). 프로젝트 공통 `.streamlit/config.toml`이 web_chat.py용으로 Streamlit 자동 페이지 목록을 숨겨 두어(`showSidebarNavigation = false`) 링크를 직접 둡니다.
+사이드바 네비게이션 메뉴로 위 4개 화면을 자유롭게 전환할 수 있습니다.
+
+#### CLI 성능 벤치마크
+터미널에서 직접 모델별 속도와 비용을 측정할 수도 있습니다:
+```bash
+uv run python rag_app/benchmark_cli.py --rag --top-k 4
+```
 
 #### OCR · RAG 평가 화면 사용 순서
 
@@ -79,22 +87,21 @@ uv run streamlit run rag_app/app.py
 
 Vertex AI 예제는 GCP 프로젝트 ID가 코드에 `project="iceu-songpa05"`로 지정되어 있으니, 본인 프로젝트로 바꿔서 사용하세요.
 
-## 예제
+## 초기 실습 및 예제 스크립트 (`exercises/`)
 
 | 파일 | 모델 | 내용 |
 | --- | --- | --- |
-| [first_ex1.py](first_ex1.py) | Gemini 2.5 Flash (Vertex AI) | 날씨·현재 시각 도구를 가진 가장 기본적인 에이전트 |
-| [second_ex.py](second_ex.py) | Ollama `gemma4:e2b` | 같은 에이전트를 로컬 모델로 실행 |
-| [third.py](third.py) | Gemini 2.5 Flash (Vertex AI) | URL에서 『위대한 개츠비』 원문을 가져와 분석. `create_agent`와 `create_deep_agent` 결과 비교, `InMemorySaver` 체크포인터 사용 |
-| [main.py](main.py) | Gemini (`init_chat_model`) | `third.py`와 같은 실험을 `init_chat_model`로 모델을 초기화해 수행 |
-| [news_agent.py](news_agent.py) | Gemini 2.5 Flash (Vertex AI) | 뉴스 기사 URL을 읽고 카테고리·제목을 Pydantic 스키마(`response_format`)로 구조화해 추출 |
-
-## 실행
+| [first_ex1.py](exercises/first_ex1.py) | Gemini 2.5 Flash (Vertex AI) | 날씨·현재 시각 도구를 가진 가장 기본적인 에이전트 |
+| [second_ex.py](exercises/second_ex.py) | Ollama `gemma4:e2b` | 같은 에이전트를 로컬 모델로 실행 |
+| [third.py](exercises/third.py) | Gemini 2.5 Flash (Vertex AI) | URL에서 『위대한 개츠비』 원문을 가져와 분석. `create_agent`와 `create_deep_agent` 결과 비교, `InMemorySaver` 체크포인터 사용 |
+| [main.py](exercises/main.py) | Gemini (`init_chat_model`) | `third.py`와 같은 실험을 `init_chat_model`로 모델을 초기화해 수행 |
+| [news_agent.py](exercises/news_agent.py) | Gemini 2.5 Flash (Vertex AI) | 뉴스 기사 URL을 읽고 카테고리·제목을 Pydantic 스키마(`response_format`)로 구조화해 추출 |
+| [first_ex1_adc.py](exercises/first_ex1_adc.py) | Gemini (ADC 인증) | API Key 없이 GCP ADC로 구동하는 에이전트 |
+| [test_inmemory_saver.py](exercises/test_inmemory_saver.py) | Gemini (Vertex AI) | LangGraph `InMemorySaver` 체크포인터 상태 영속화 테스트 |
 
 ```bash
-uv run python first_ex1.py
-uv run python second_ex.py     # 사전에: ollama pull gemma4:e2b
-uv run python third.py
-uv run python main.py
-uv run python news_agent.py
+uv run python exercises/first_ex1.py
+uv run python exercises/second_ex.py     # 사전에: ollama pull gemma4:e2b
+uv run python exercises/third.py
+uv run python exercises/news_agent.py
 ```
