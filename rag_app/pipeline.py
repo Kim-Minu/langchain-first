@@ -527,6 +527,14 @@ def find_same_index(collection_name: str, index_key: str) -> dict | None:
     return info
 
 
+PAPER_REGISTRY_KEY = "papers"  # arxiv_service가 논문 공용 컬렉션의 metadata에 남기는 논문별 기록
+
+
+def is_paper_collection(metadata: dict | None) -> bool:
+    """arXiv 논문 공용 컬렉션인지 (metadata에 논문 기록이 있으면). 이름이 아니라 내용으로 판별해 오판이 없게 함."""
+    return isinstance(metadata, dict) and PAPER_REGISTRY_KEY in metadata
+
+
 def save_to_store(
     store: PGVector, chunks: list[Document], vectors: list[list[float]], index_info: dict,
 ) -> list[str]:
@@ -536,6 +544,9 @@ def save_to_store(
     - index_info(인덱싱 키 · 파일 해시 · 청크 수 등)는 청크 저장이 끝난 뒤 컬렉션 metadata에 기록
       → 저장 도중 실패하면 키가 남지 않아 다음 인덱싱에서 잘못 건너뛰지 않음
     """
+    # 논문 컬렉션은 여러 논문이 누적돼 있어 통째로 비우면 모두 사라지므로 거부 (어느 화면에서 불려도)
+    if is_paper_collection(get_collection_info(store.collection_name)):
+        raise ValueError(f"`{store.collection_name}`은 arXiv 논문 컬렉션이라 덮어쓸 수 없습니다. 다른 이름을 쓰세요.")
     store.delete_collection()
     store.create_collection()
     ids = store.add_embeddings(

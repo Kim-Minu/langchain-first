@@ -1,6 +1,7 @@
 """RAG 실습의 기본 설정값. 화면 사이드바에서 바꿀 수 있는 값은 범위(min/max)도 함께 둔다."""
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -215,3 +216,15 @@ FAITHFULNESS_PROMPT = (
     "- 주장이 하나도 없으면 빈 목록\n\n"
     "[문서]\n{context}\n\n[답변]\n{answer}"
 )
+
+# ---------------------------------------------------------------------------
+# arXiv 논문 검색 · 질의 화면 (pages/arxiv_qa.py)
+# ---------------------------------------------------------------------------
+# 모든 논문을 한 컬렉션에 누적하고 청크 metadata의 arxiv_id로 구분.
+# 다른 임베딩 모델 · 차원의 벡터가 한 컬렉션에 섞이면 검색이 무의미해지므로 이름에 모델 · 차원을 넣음
+ARXIV_COLLECTION_PREFIX = os.getenv("RAG_ARXIV_COLLECTION", "arxiv_papers")
+_EMBEDDING_SLUG = re.sub(r"\W+", "_", EMBEDDING_MODEL)  # f-string 안 백슬래시는 Python 3.11에서 문법 오류
+ARXIV_COLLECTION = f"{ARXIV_COLLECTION_PREFIX}_{_EMBEDDING_SLUG}_d{EMBEDDING_DIMENSION}"
+# 받은 PDF (git 제외 폴더)
+ARXIV_DATA_DIR = Path(__file__).resolve().parent / "data" / "arxiv"
+ARXIV_MAX_RESULTS = 10

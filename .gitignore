@@ -21,3 +21,6 @@ rag_app/eval/data/
 
 # Ragas 평가 결과 CSV (retrieved_contexts에 원문 청크가 들어 있음)
 rag_app/eval/results/
+
+# arXiv에서 받은 논문 PDF
+rag_app/data/
