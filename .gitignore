@@ -18,3 +18,6 @@ wheels/
 
 # rag_app 평가용 원본 PDF · OCR 결과 (저작물이라 공개 저장소에 올리지 않음)
 rag_app/eval/data/
+
+# Ragas 평가 결과 CSV (retrieved_contexts에 원문 청크가 들어 있음)
+rag_app/eval/results/
