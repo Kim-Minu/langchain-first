@@ -23,6 +23,8 @@ from rag_app import config
 from rag_app import pipeline as rag
 from rag_app.ui_common import get_embeddings, get_llm, preview, render_left_menu, show_error, step_header
 
+PDF_KIND_LABEL = {"text": "텍스트 PDF", "image": "이미지(스캔) PDF", "mixed": "혼합 PDF"}
+
 st.set_page_config(page_title="arXiv 논문 질의", page_icon="📚", layout="wide")
 render_left_menu()
 
@@ -89,10 +91,21 @@ if papers:
                 try:
                     st.write("PDF 다운로드")
                     pdf_path = ax.download_pdf(paper)
-                    st.write("청크 → 임베딩 → 저장")
-                    result = ax.index_paper(paper, pdf_path, embeddings)
+                    st.write("페이지 분석 (스캔 페이지는 OCR) → 청크 → 임베딩 → 저장")
+                    result = ax.index_paper(
+                        paper, pdf_path, embeddings, ocr_llm=get_llm(config.ARXIV_OCR_MODEL, config.IMAGE_MAX_OUTPUT_TOKENS),
+                    )
+                    kind = PDF_KIND_LABEL[result.pdf_kind]
+                    if result.ocr_pages:
+                        kind += f" · OCR {len(result.ocr_pages)}쪽"
                     label = "이미 저장됨 · 건너뜀" if result.skipped else f"저장 완료 · 청크 {result.chunks}개"
-                    status.update(label=f"{paper.arxiv_id} — {label}", state="complete")
+                    if result.ocr_failures:
+                        st.warning(f"OCR 실패 {len(result.ocr_failures)}건 — 다시 저장하면 실패한 페이지만 다시 OCR합니다.")
+                        st.caption("\n".join(result.ocr_failures[:5]))
+                    if result.ocr_warnings:  # 디코딩 실패 · 단색 이미지 등은 다시 해도 같으므로 안내만
+                        st.info(f"읽지 못한 이미지 {len(result.ocr_warnings)}건 (다시 저장해도 같음)")
+                        st.caption("\n".join(result.ocr_warnings[:5]))
+                    status.update(label=f"{paper.arxiv_id} — {label} · {kind}", state="complete")
                 except Exception as e:
                     status.update(label=f"{paper.arxiv_id} — 실패", state="error", expanded=True)
                     show_error(f"{paper.arxiv_id} 저장", e)
@@ -120,18 +133,40 @@ if candidates:
             st.session_state["arxiv_preview"] = {"arxiv_id": preview_id, "path": str(path)}
         except Exception as e:
             show_error(f"{preview_id} 미리보기", e)
-    preview = st.session_state.get("arxiv_preview")
+    # 변수 이름을 shown으로 — preview는 ui_common에서 가져온 요약 함수 이름
+    shown = st.session_state.get("arxiv_preview")
     # 다른 논문을 고르면 이전 논문의 PDF를 그 이름 아래 보여 주지 않음
-    if preview and preview["arxiv_id"] == preview_id and Path(preview["path"]).exists():
-        st.pdf(preview["path"], height=800)
+    if shown and shown["arxiv_id"] == preview_id and Path(shown["path"]).exists():
+        if st.button("✕ 미리보기 닫기", key="arxiv_preview_close"):
+            st.session_state.pop("arxiv_preview", None)
+            st.rerun()
+        st.pdf(shown["path"], height=800)
 
 # ---------------------------------------------------------------------------
 # 4. 질의
 # ---------------------------------------------------------------------------
-step_header("4", "논문 질의", f"저장된 논문 {len(stored)}편. 대상을 고르지 않으면 전체에서 찾습니다.")
+step_header(
+    "4", "논문 질의",
+    f"저장된 논문 {len(stored)}편. 대상을 고르지 않으면 전체에서 찾습니다. "
+    f"의미 검색 · BM25 키워드 검색 각 {config.ARXIV_CANDIDATES}개를 합쳐 상위 {config.ARXIV_TOP_K}개를 근거로 씁니다.",
+)
 if not stored:
     st.info("저장된 논문이 없습니다. 위에서 검색해 저장하세요.")
     st.stop()
+
+with st.expander(f"저장된 논문 관리 ({len(stored)}편)"):
+    st.caption("삭제하면 청크와 기록이 지워집니다. 받아 둔 PDF는 남아 있어 다시 저장할 때 내려받지 않습니다.")
+    for p in stored:
+        col_info, col_del = st.columns([6, 1])
+        kind = PDF_KIND_LABEL.get(p.get("pdf_kind", "text"), "")
+        col_info.markdown(f"**{p['arxiv_id']}** · {p['title']}  \n청크 {p['chunks']}개 · {kind} · {p.get('indexed_at', '')}")
+        if col_del.button("🗑️ 삭제", key=f"arxiv_del_{p['arxiv_id']}", width="stretch"):
+            try:
+                ax.delete_paper(p["arxiv_id"])
+            except Exception as e:
+                show_error(f"{p['arxiv_id']} 삭제", e)
+            else:
+                st.rerun()
 
 titles = {p["arxiv_id"]: f"{p['arxiv_id']} · {p['title']}" for p in stored}
 targets = st.multiselect("대상 논문", list(titles), format_func=titles.get)
@@ -147,6 +182,11 @@ if st.button("질문하기", type="primary", disabled=not question.strip()):
         show_error("질의", e)
     else:
         st.markdown(answer)
-        for i, (doc, distance) in enumerate(hits, start=1):
-            with st.expander(f"[{i}] {doc.metadata.get('source', '?')} p.{rag.page_label(doc)} · 거리 {distance:.3f}"):
+        for i, (doc, ranks) in enumerate(hits, start=1):
+            # 어느 검색에서 몇 위로 찾았는지 (— 는 그 검색의 후보에 없었음)
+            found = " · ".join(
+                f"{name} {ranks[key]}위" if ranks[key] else f"{name} —"
+                for name, key in (("의미", "vector_rank"), ("BM25", "bm25_rank"))
+            )
+            with st.expander(f"[{i}] {doc.metadata.get('source', '?')} p.{rag.page_label(doc)} · {found}"):
                 st.text(doc.page_content)

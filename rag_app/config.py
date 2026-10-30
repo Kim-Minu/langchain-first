@@ -228,3 +228,29 @@ ARXIV_COLLECTION = f"{ARXIV_COLLECTION_PREFIX}_{_EMBEDDING_SLUG}_d{EMBEDDING_DIM
 # 받은 PDF (git 제외 폴더)
 ARXIV_DATA_DIR = Path(__file__).resolve().parent / "data" / "arxiv"
 ARXIV_MAX_RESULTS = 10
+
+# 질의: 의미 검색 · BM25가 각각 ARXIV_CANDIDATES개를 뽑고 가중 RRF로 합쳐 ARXIV_TOP_K개를 근거로 씀
+ARXIV_TOP_K = 5
+ARXIV_CANDIDATES = 10
+ARXIV_HYBRID_WEIGHTS = (0.5, 0.5)  # (BM25, 의미 검색)
+
+# 질문에 한글이 있으면 BM25용으로 영어 검색 키워드를 만듦 (논문은 대부분 영어라 한글 질문은 키워드가 맞지 않음)
+ARXIV_KEYWORD_PROMPT = (
+    "다음 질문으로 영어 논문 본문을 키워드 검색(BM25)하려고 합니다. "
+    "검색에 쓸 영어 키워드와 전문 용어만 공백으로 구분해 한 줄로 출력하세요. 설명 · 따옴표 · 번호 없이.\n\n"
+    "질문: {question}"
+)
+
+# 텍스트 레이어 글자 수가 이보다 적고 이미지가 있는 페이지를 스캔 페이지로 보고 OCR
+ARXIV_OCR_MIN_CHARS = 50
+# OCR 모델은 답변 모델과 따로 바꿀 수 있게 (할당량 분리 등). 출력 한도는 이미지 읽기용(IMAGE_MAX_OUTPUT_TOKENS) —
+# 수식 · 표가 빽빽한 2단 페이지가 답변용 한도(추론 토큰 포함)에서 잘리지 않게
+ARXIV_OCR_MODEL = os.getenv("RAG_ARXIV_OCR_MODEL", LLM_MODEL)
+ARXIV_OCR_PROMPT = (
+    "이 이미지는 학술 논문의 한 페이지를 스캔한 것입니다. 페이지에 인쇄된 텍스트를 원문 언어 그대로 받아 적으세요.\n"
+    "- 제목 · 저자 · 초록 · 본문 · 각주 · 그림과 표의 캡션을 읽는 순서대로 (2단 편집이면 왼쪽 단 먼저)\n"
+    "- 수식은 LaTeX로 (예: $E = mc^2$), 표는 마크다운 표로\n"
+    "- 줄 끝에서 끊긴 단어 · 문장은 이어 붙이고, 문단 사이는 빈 줄 하나로 구분\n"
+    "- 쪽 번호 · 반복되는 머리말은 제외\n"
+    "설명 문구나 코드 블록 기호 없이 텍스트만 출력하세요. 인쇄된 텍스트가 없는 페이지는 빈 문자열만 출력하세요."
+)

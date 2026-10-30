@@ -412,10 +412,17 @@ def test_page_search_and_preview(tmp_path, monkeypatch):
         assert at.get("arrow_data_frame") or at.get("dataframe")  # 검색 결과 표
         next(b for b in at.button if b.label == "미리보기").click().run()
 
+        assert not at.exception
+        assert downloaded == ["2401.00001v1"]  # 받지 않은 논문은 미리보기 때 다운로드
+        assert at.session_state["arxiv_preview"] == {"arxiv_id": "2401.00001v1", "path": str(tmp_path / "preview.pdf")}
+        assert at.get("bidi_component")  # st.pdf 뷰어
+
+        # 닫기 버튼을 누르면 뷰어가 사라지고 상태도 지워짐
+        next(b for b in at.button if b.label == "✕ 미리보기 닫기").click().run()
     assert not at.exception
-    assert downloaded == ["2401.00001v1"]  # 받지 않은 논문은 미리보기 때 다운로드
-    assert at.session_state["arxiv_preview"] == {"arxiv_id": "2401.00001v1", "path": str(tmp_path / "preview.pdf")}
-    assert at.get("bidi_component")  # st.pdf 뷰어
+    assert "arxiv_preview" not in at.session_state
+    assert not at.get("bidi_component")
+    assert not [b for b in at.button if b.label == "✕ 미리보기 닫기"]
 
 
 def test_save_to_store_still_works_for_normal_collection(collection):
@@ -429,3 +436,351 @@ def test_save_to_store_still_works_for_normal_collection(collection):
     info = rag.get_collection_info(collection)
     assert (info["stored_chunks"], info["index_key"], info["chunks"]) == (2, "k2", 2)
     assert not rag.is_paper_collection(info)
+
+
+# ---------------------------------------------------------------------------
+# 2차: R8 OCR · R9 top-k · R10 하이브리드 · R11 삭제 · R12 이전
+# ---------------------------------------------------------------------------
+import io  # noqa: E402
+
+import pypdf  # noqa: E402
+from langchain_core.language_models import BaseChatModel  # noqa: E402
+from langchain_core.messages import AIMessage  # noqa: E402
+from langchain_core.outputs import ChatGeneration, ChatResult  # noqa: E402
+from PIL import Image, ImageDraw  # noqa: E402
+
+
+class RecordingLLM(BaseChatModel):
+    """받은 프롬프트 텍스트를 기록하고 정해진 답을 돌려줌. fail=True면 항상 오류 (OCR 실패 흉내)."""
+
+    responses: list[str] = ["가짜 답변"]
+    fail: bool = False
+    prompts: list[str] = []
+
+    @property
+    def _llm_type(self) -> str:
+        return "recording-fake"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        content = messages[-1].content
+        text = content if isinstance(content, str) else " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+        self.prompts.append(text)
+        if self.fail:
+            raise RuntimeError("503 UNAVAILABLE")
+        answer = self.responses[(len(self.prompts) - 1) % len(self.responses)]
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=answer))])
+
+
+class ConstantEmbeddings(FakeEmbeddings):
+    """모든 텍스트가 같은 벡터 → 의미 검색이 아무 정보도 주지 못하는 상황 (BM25만 구분 가능)."""
+
+    def _vector(self, text: str) -> list[float]:
+        return [1 / math.sqrt(config.EMBEDDING_DIMENSION)] * config.EMBEDDING_DIMENSION
+
+
+def make_image_pdf(pages: int) -> bytes:
+    """텍스트 레이어 없이 이미지만 있는 스캔 PDF."""
+    images = []
+    for i in range(pages):
+        img = Image.new("RGB", (400, 300), "white")
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((5, 5, 395, 295), outline="black")
+        draw.text((20, 20), f"scanned page {i + 1}", fill="black")
+        images.append(img)
+    buffer = io.BytesIO()
+    images[0].save(buffer, format="PDF", save_all=True, append_images=images[1:])
+    return buffer.getvalue()
+
+
+def merge_pdfs(*parts: bytes) -> bytes:
+    writer = pypdf.PdfWriter()
+    for part in parts:
+        for page in pypdf.PdfReader(io.BytesIO(part)).pages:
+            writer.add_page(page)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+OCR_TEXT = " ".join(f"ocr scanned sentence {i}." for i in range(60))
+
+
+@pytest.fixture
+def ocr_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(ax, "OCR_CACHE_DIR", tmp_path / "ocr_pages")
+
+
+def test_analyze_text_pdf_skips_ocr(tmp_path, collection, ocr_cache):
+    paper = make_paper("2401.00001v1")
+    ocr = RecordingLLM(responses=[OCR_TEXT])
+    result = ax.index_paper(paper, write_paper_pdf(tmp_path, paper, "attention"), FakeEmbeddings(), collection, ocr)
+
+    assert (result.pdf_kind, result.ocr_pages) == ("text", ())
+    assert ocr.prompts == []  # 텍스트 PDF는 LLM을 부르지 않음
+    assert ax.list_indexed_papers(collection)[0]["pdf_kind"] == "text"
+
+
+def test_index_scanned_pdf_runs_ocr(tmp_path, collection, ocr_cache):
+    paper = make_paper("2401.00001v1")
+    pdf = ax.pdf_path_for(paper.arxiv_id, tmp_path)
+    pdf.write_bytes(make_image_pdf(2))
+    ocr = RecordingLLM(responses=[OCR_TEXT])
+
+    result = ax.index_paper(paper, pdf, FakeEmbeddings(), collection, ocr)
+
+    assert (result.pdf_kind, result.ocr_pages, result.ocr_failures) == ("image", (1, 2), ())
+    assert len(ocr.prompts) == 2 and all("학술 논문" in p for p in ocr.prompts)  # 논문용 OCR 프롬프트
+    _, hits = ax.ask("ocr scanned sentence", RecordingLLM(), FakeEmbeddings(), collection)
+    assert hits and all("ocr scanned" in doc.page_content for doc, _ in hits)  # OCR 결과가 청크로 저장됨
+
+
+def test_index_mixed_pdf_ocr_only_image_pages(tmp_path, collection, ocr_cache):
+    paper = make_paper("2401.00001v1")
+    text_page = make_pdf([" ".join(f"attention sentence {i}." for i in range(120))])
+    pdf = ax.pdf_path_for(paper.arxiv_id, tmp_path)
+    pdf.write_bytes(merge_pdfs(text_page, make_image_pdf(1)))
+    ocr = RecordingLLM(responses=[OCR_TEXT])
+
+    result = ax.index_paper(paper, pdf, FakeEmbeddings(), collection, ocr)
+
+    assert (result.pdf_kind, result.ocr_pages) == ("mixed", (2,))
+    assert len(ocr.prompts) == 1
+
+
+def test_index_scanned_pdf_requires_ocr_llm(tmp_path, collection, ocr_cache):
+    paper = make_paper("2401.00001v1")
+    pdf = ax.pdf_path_for(paper.arxiv_id, tmp_path)
+    pdf.write_bytes(make_image_pdf(1))
+    with pytest.raises(ValueError, match="OCR할 모델"):
+        ax.index_paper(paper, pdf, FakeEmbeddings(), collection)
+    assert ax.list_indexed_papers(collection) == []
+
+
+def test_ocr_failure_is_retried_next_time(tmp_path, collection, ocr_cache):
+    paper = make_paper("2401.00001v1")
+    pdf = ax.pdf_path_for(paper.arxiv_id, tmp_path)
+    pdf.write_bytes(merge_pdfs(make_pdf([" ".join(f"attention sentence {i}." for i in range(120))]), make_image_pdf(1)))
+
+    failed = ax.index_paper(paper, pdf, FakeEmbeddings(), collection, RecordingLLM(fail=True))
+    assert failed.ocr_failures and ax.list_indexed_papers(collection)[0]["ocr_failures"]
+
+    # OCR 실패 기록이 있으면 같은 설정이어도 건너뛰지 않고 다시 OCR
+    ocr = RecordingLLM(responses=[OCR_TEXT])
+    retried = ax.index_paper(paper, pdf, FakeEmbeddings(), collection, ocr)
+    assert not retried.skipped and retried.ocr_failures == () and len(ocr.prompts) == 1
+    assert ax.list_indexed_papers(collection)[0]["ocr_failures"] == []
+
+    # 이제 온전히 저장됐으므로 건너뜀 (OCR 호출 없음)
+    again = RecordingLLM(responses=[OCR_TEXT])
+    assert ax.index_paper(paper, pdf, FakeEmbeddings(), collection, again).skipped and again.prompts == []
+
+
+def _paper_with_rare_word(tmp_path, collection, embeddings):
+    paper = make_paper("2401.00001v1", title="Rare Word Paper")
+    # 페이지마다 다른 문장 (내용이 같은 청크는 RRF에서 하나로 합쳐지므로)
+    pages = [" ".join(f"model training sentence p{n} {i}." for i in range(100)) for n in range(9)]
+    pages[4] = " ".join(f"model training sentence p4 {i}." for i in range(50)) + " the zygomorphic estimator works."
+    pdf = ax.pdf_path_for(paper.arxiv_id, tmp_path)
+    pdf.write_bytes(make_pdf(pages))
+    ax.index_paper(paper, pdf, embeddings, collection)
+    return paper
+
+
+def test_hybrid_finds_keyword_missed_by_vector(tmp_path, collection):
+    _paper_with_rare_word(tmp_path, collection, ConstantEmbeddings())
+
+    _, hits = ax.ask("zygomorphic estimator", RecordingLLM(), ConstantEmbeddings(), collection)
+
+    rare = [(doc, ranks) for doc, ranks in hits if "zygomorphic" in doc.page_content]
+    assert rare and rare[0][1]["bm25_rank"] == 1  # 의미 검색으로는 구분 못 하는 정확한 키워드를 BM25가 1위로
+
+
+def test_ask_returns_top_5(tmp_path, collection):
+    _paper_with_rare_word(tmp_path, collection, FakeEmbeddings())
+    _, hits = ax.ask("model training", RecordingLLM(), FakeEmbeddings(), collection)
+    assert config.ARXIV_TOP_K == 5 and len(hits) == 5
+    assert [ranks["rrf_rank"] for _, ranks in hits] == [1, 2, 3, 4, 5]
+
+
+def test_bm25_query_translation(tmp_path, collection):
+    # 영어 질문: 변환 호출 없이 그대로
+    llm = RecordingLLM()
+    assert ax.keyword_query("zygomorphic estimator", llm) == "zygomorphic estimator" and llm.prompts == []
+
+    # 한글 질문: LLM이 만든 영어 키워드로 BM25 검색, 답변은 같은 LLM의 다음 호출
+    _paper_with_rare_word(tmp_path, collection, ConstantEmbeddings())
+    llm = RecordingLLM(responses=["zygomorphic estimator", "가짜 답변"])
+    answer, hits = ax.ask("자이고모픽 추정량이 뭐야?", llm, ConstantEmbeddings(), collection)
+
+    assert "자이고모픽 추정량이 뭐야?" in llm.prompts[0] and "영어 키워드" in llm.prompts[0]
+    assert answer == "가짜 답변"
+    assert any("zygomorphic" in doc.page_content and ranks["bm25_rank"] == 1 for doc, ranks in hits)
+
+
+def test_bm25_cache_follows_generation(tmp_path, collection, monkeypatch):
+    paper = make_paper("2401.00001v1")
+    pdf = write_paper_pdf(tmp_path, paper, "attention")
+    ax.index_paper(paper, pdf, FakeEmbeddings(), collection)
+    ax.ask("attention", RecordingLLM(), FakeEmbeddings(), collection)
+
+    monkeypatch.setattr(config, "CHUNK_SIZE", 500)
+    monkeypatch.setattr(config, "CHUNK_OVERLAP", 100)
+    ax.index_paper(paper, pdf, FakeEmbeddings(), collection)
+    new_key = ax.list_indexed_papers(collection)[0]["index_key"]
+    _, hits = ax.ask("attention", RecordingLLM(), FakeEmbeddings(), collection)
+
+    # 옛 세대는 지워졌고 BM25도 새 세대 청크로 다시 만들어 BM25에서 찾은 근거가 모두 새 세대
+    bm25_hits = [doc for doc, ranks in hits if ranks["bm25_rank"]]
+    assert bm25_hits and {doc.metadata["index_key"] for doc in bm25_hits} == {new_key}
+
+
+def test_delete_paper(tmp_path, collection):
+    a, b = make_paper("2401.00001v1", title="A"), make_paper("2401.00002v1", title="B")
+    ax.index_paper(a, write_paper_pdf(tmp_path, a, "attention"), FakeEmbeddings(), collection)
+    b_result = ax.index_paper(b, write_paper_pdf(tmp_path, b, "graph"), FakeEmbeddings(), collection)
+
+    assert ax.delete_paper(a.arxiv_id, collection)
+
+    assert [p["arxiv_id"] for p in ax.list_indexed_papers(collection)] == [b.arxiv_id]
+    assert chunk_count(collection, a.arxiv_id) == 0
+    assert chunk_count(collection, b.arxiv_id) == b_result.chunks
+    assert ax.ask("attention", RecordingLLM(), FakeEmbeddings(), collection, arxiv_ids=[a.arxiv_id]) == (ax.NO_HITS_ANSWER, [])
+    assert ax.pdf_path_for(a.arxiv_id, tmp_path).exists()  # 받아 둔 PDF는 남김
+    assert not ax.delete_paper(a.arxiv_id, collection)  # 이미 없으면 False
+
+
+@pytest.fixture
+def legacy_collection():
+    name = f"test_arxiv_legacy_{uuid.uuid4().hex[:8]}"
+    yield name
+    rag.delete_stored_collection(name)
+
+
+def _make_legacy(tmp_path, legacy_name: str) -> tuple[ax.Paper, int]:
+    """세대 표시(index_key)가 청크에 없던 수정 전 형태의 컬렉션을 만듦."""
+    paper = make_paper("2401.00001v1", title="Legacy Paper")
+    result = ax.index_paper(paper, write_paper_pdf(tmp_path, paper, "attention"), FakeEmbeddings(), legacy_name)
+    with psycopg.connect(config.DATABASE_URL) as conn:
+        conn.execute(
+            "UPDATE langchain_pg_embedding e SET cmetadata = e.cmetadata - 'index_key' - 'generation' "
+            "FROM langchain_pg_collection c WHERE e.collection_id = c.uuid AND c.name = %s",
+            (legacy_name,),
+        )
+        conn.execute(  # 기록에도 generation이 없던 시절
+            "UPDATE langchain_pg_collection SET cmetadata = (cmetadata::jsonb #- %s)::json WHERE name = %s",
+            (["papers", paper.arxiv_id, "generation"], legacy_name),
+        )
+    return paper, result.chunks
+
+
+def test_migrate_legacy_collection(tmp_path, legacy_collection, collection):
+    paper, chunks = _make_legacy(tmp_path, legacy_collection)
+    assert ax.ask("attention", RecordingLLM(), FakeEmbeddings(), legacy_collection) == (ax.NO_HITS_ANSWER, [])  # 이전 전엔 검색 안 됨
+
+    assert ax.migrate_legacy_collection(legacy_collection, collection) == 1
+
+    assert rag.get_collection_info(legacy_collection) is None
+    _, hits = ax.ask("attention", RecordingLLM(), FakeEmbeddings(), collection)
+    assert hits and chunk_count(collection, paper.arxiv_id) == chunks
+    # 재임베딩 없이 "이미 저장됨"으로 인정
+    assert ax.index_paper(paper, ax.pdf_path_for(paper.arxiv_id, tmp_path), FakeEmbeddings(), collection).skipped
+
+
+def test_migrate_refuses_existing_target(tmp_path, legacy_collection, collection):
+    paper, chunks = _make_legacy(tmp_path, legacy_collection)
+    rag.get_vector_store(FakeEmbeddings(), collection)  # 새 이름이 이미 있음
+
+    with pytest.raises(ValueError, match="이미 있어"):
+        ax.migrate_legacy_collection(legacy_collection, collection)
+    assert chunk_count(legacy_collection, paper.arxiv_id) == chunks  # 원본 그대로
+
+
+# ---------------------------------------------------------------------------
+# 2차 리뷰 반영: 저장마다 세대 id (M1) · OCR 실패와 추출 경고 분리 (M2) · 키워드 변환 실패
+# ---------------------------------------------------------------------------
+def _mixed_paper(tmp_path):
+    paper = make_paper("2401.00001v1")
+    pdf = ax.pdf_path_for(paper.arxiv_id, tmp_path)
+    pdf.write_bytes(merge_pdfs(make_pdf([" ".join(f"attention sentence {i}." for i in range(120))]), make_image_pdf(1)))
+    return paper, pdf
+
+
+OCR_RARE = " ".join(f"ocr scanned sentence {i}." for i in range(40)) + " the quasicrystal lattice appears."
+
+
+def test_ocr_retry_failure_keeps_live_generation(tmp_path, collection, ocr_cache, monkeypatch):
+    paper, pdf = _mixed_paper(tmp_path)
+    first = ax.index_paper(paper, pdf, FakeEmbeddings(), collection, RecordingLLM(fail=True))
+    live = ax.list_indexed_papers(collection)[0]
+
+    # OCR 재시도는 같은 index_key지만, 저장 도중 실패해도 지금 검색되는 세대를 먼저 지우지 않아야 함
+    original_add = PGVector.add_embeddings
+
+    def add_half_then_fail(self, texts, embeddings, metadatas=None, **kwargs):
+        half = len(texts) // 2
+        original_add(self, texts[:half], embeddings[:half], metadatas[:half], **kwargs)
+        raise RuntimeError("DB 연결 끊김")
+
+    monkeypatch.setattr(PGVector, "add_embeddings", add_half_then_fail)
+    with pytest.raises(RuntimeError):
+        ax.index_paper(paper, pdf, FakeEmbeddings(), collection, RecordingLLM(responses=[OCR_RARE]))
+
+    record = ax.list_indexed_papers(collection)[0]
+    assert record["generation"] == live["generation"]
+    assert ax._count_paper_chunks(collection, paper.arxiv_id, live["generation"]) == first.chunks
+    _, hits = ax.ask("attention sentence", RecordingLLM(), FakeEmbeddings(), collection, k=20)
+    assert hits and {doc.metadata["generation"] for doc, _ in hits} == {live["generation"]}
+
+
+def test_ocr_retry_refreshes_bm25_cache(tmp_path, collection, ocr_cache):
+    paper, pdf = _mixed_paper(tmp_path)
+    ax.index_paper(paper, pdf, FakeEmbeddings(), collection, RecordingLLM(fail=True))
+    ax.ask("quasicrystal lattice", RecordingLLM(), FakeEmbeddings(), collection)  # 실패 상태로 BM25 캐시가 만들어짐
+
+    ax.index_paper(paper, pdf, FakeEmbeddings(), collection, RecordingLLM(responses=[OCR_RARE]))
+    _, hits = ax.ask("quasicrystal lattice", RecordingLLM(), FakeEmbeddings(), collection)
+
+    # 같은 index_key로 다시 저장했어도 세대가 바뀌어 BM25가 새 청크(OCR 결과)를 찾음
+    assert any("quasicrystal" in doc.page_content and ranks["bm25_rank"] == 1 for doc, ranks in hits)
+    live = ax.list_indexed_papers(collection)[0]["generation"]
+    assert {doc.metadata["generation"] for doc, _ in hits} == {live}
+
+
+def test_extraction_warning_does_not_block_skip(tmp_path, collection, ocr_cache):
+    # 글자 없는 페이지에 단색(흰색) 이미지 → 다시 해도 같은 추출 문제라 경고만, 건너뛰기는 정상
+    paper = make_paper("2401.00001v1")
+    blank = io.BytesIO()
+    Image.new("RGB", (300, 300), "white").save(blank, format="PDF")
+    pdf = ax.pdf_path_for(paper.arxiv_id, tmp_path)
+    pdf.write_bytes(merge_pdfs(make_pdf([" ".join(f"attention sentence {i}." for i in range(120))]), blank.getvalue()))
+    ocr = RecordingLLM(responses=[OCR_TEXT])
+
+    first = ax.index_paper(paper, pdf, FakeEmbeddings(), collection, ocr)
+    assert first.ocr_warnings and "단색" in first.ocr_warnings[0] and first.ocr_failures == ()
+    assert ocr.prompts == []  # OCR할 이미지가 없어 LLM 호출 없음
+    assert ax.index_paper(paper, pdf, FakeEmbeddings(), collection, ocr).skipped
+
+
+def test_keyword_query_falls_back_on_error():
+    # 변환 호출이 429 등으로 실패해도 원문으로 BM25 진행 (의미 검색은 영향 없음)
+    assert ax.keyword_query("자이고모픽 추정량", RecordingLLM(fail=True)) == "자이고모픽 추정량"
+
+
+def test_backfill_generation(tmp_path, legacy_collection):
+    # 이미 새 이름으로 옮겼지만 세대 id가 없던 컬렉션 (실제 데이터의 상황)
+    paper, chunks = _make_legacy(tmp_path, legacy_collection)
+    assert ax.ask("attention", RecordingLLM(), FakeEmbeddings(), legacy_collection) == (ax.NO_HITS_ANSWER, [])
+
+    assert ax.backfill_generation(legacy_collection) == 1
+    assert ax.backfill_generation(legacy_collection) == 0  # 두 번 실행해도 그대로
+
+    _, hits = ax.ask("attention", RecordingLLM(), FakeEmbeddings(), legacy_collection)
+    assert hits and chunk_count(legacy_collection, paper.arxiv_id) == chunks
+    assert ax.index_paper(paper, ax.pdf_path_for(paper.arxiv_id, tmp_path), FakeEmbeddings(), legacy_collection).skipped
+
+
+def test_delete_paper_removes_legacy_chunks(tmp_path, legacy_collection):
+    # 세대 id가 없는 옛 청크도 논문 삭제 시 남지 않음 (R11)
+    paper, _ = _make_legacy(tmp_path, legacy_collection)
+    assert ax.delete_paper(paper.arxiv_id, legacy_collection)
+    assert chunk_count(legacy_collection, paper.arxiv_id) == 0
