@@ -3,13 +3,14 @@
 
 1. 검색: 키워드 → arXiv 논문 목록 (제목 · 저자 · 게시일 · 요약)
 2. 저장: 고른 논문 PDF 다운로드 → 청크 → 임베딩 → 공용 컬렉션(config.ARXIV_COLLECTION)에 누적
-3. 저장된 논문: 목록 · PDF 미리보기 · 삭제 (검색 결과는 표의 PDF 링크로 새 탭에서)
+3. 저장된 논문: 표에서 행을 골라 PDF 미리보기 · 삭제 (검색 결과는 표의 PDF 링크로 새 탭에서)
 4. 질의: 저장된 논문 전체 또는 고른 논문만 검색해 답변 + 근거 청크
 
 로직은 rag_app/arxiv_service.py, 이 파일은 화면만 담당한다.
 실행: uv run streamlit run rag_app/app.py → 사이드바 "📚 arXiv 논문 질의" 링크
 """
 
+import hashlib
 import sys
 from pathlib import Path
 
@@ -126,25 +127,55 @@ if not stored:
     st.info("저장된 논문이 없습니다. 위에서 검색해 저장하세요.")
     st.stop()
 
-for p in stored:
+def stored_grid_key(papers: list[dict]) -> str:
+    # 표의 선택은 행 번호로 기억되므로, 논문이 추가 · 삭제되면 key를 바꿔 선택이 다른 논문을 가리키지 않게 함
+    ids = "|".join(p["arxiv_id"] for p in papers)
+    return "arxiv_stored_grid_" + hashlib.md5(ids.encode()).hexdigest()[:8]
+
+
+grid = st.dataframe(
+    pd.DataFrame([
+        {
+            "arXiv ID": p["arxiv_id"],
+            "제목": p["title"],
+            "저자": ", ".join(p.get("authors", [])[:3]) + (" 외" if len(p.get("authors", [])) > 3 else ""),
+            "게시일": p.get("published", ""),
+            "PDF 유형": PDF_KIND_LABEL.get(p.get("pdf_kind", "text"), ""),
+            "OCR 쪽": len(p.get("ocr_pages", [])),
+            "청크": p["chunks"],
+            "저장 시각": p.get("indexed_at", ""),
+            "PDF": ax.paper_from_record(p).pdf_url,
+        }
+        for p in stored
+    ]),
+    hide_index=True,
+    width="stretch",
+    on_select="rerun",
+    selection_mode="single-row",
+    column_config={"PDF": st.column_config.LinkColumn("PDF", display_text="열기 ↗", help="arXiv PDF를 새 탭에서 엽니다")},
+    key=stored_grid_key(stored),
+)
+selected = stored[grid.selection.rows[0]] if grid.selection.rows else None
+if selected is None:
+    st.caption("행을 선택하면 미리보기 · 삭제할 수 있습니다.")
+else:
     col_info, col_view, col_del = st.columns([6, 1, 1])
-    kind = PDF_KIND_LABEL.get(p.get("pdf_kind", "text"), "")
-    col_info.markdown(f"**{p['arxiv_id']}** · {p['title']}  \n청크 {p['chunks']}개 · {kind} · {p.get('indexed_at', '')}")
-    if col_view.button("📄 미리보기", key=f"arxiv_view_{p['arxiv_id']}", width="stretch"):
+    col_info.markdown(f"**{selected['arxiv_id']}** · {selected['title']}")
+    if col_view.button("📄 미리보기", key="arxiv_view", width="stretch"):
         try:
             with st.spinner("PDF 준비 중..."):
-                path = ax.download_pdf(ax.paper_from_record(p))  # 받아 둔 파일이 있으면 그대로, 없으면 다시 받음
+                path = ax.download_pdf(ax.paper_from_record(selected))  # 받아 둔 파일이 있으면 그대로, 없으면 다시 받음
             # 다른 위젯을 눌러도 유지되게 저장하되, 어떤 논문의 파일인지 함께 기록
-            st.session_state["arxiv_preview"] = {"arxiv_id": p["arxiv_id"], "path": str(path)}
+            st.session_state["arxiv_preview"] = {"arxiv_id": selected["arxiv_id"], "path": str(path)}
         except Exception as e:
-            show_error(f"{p['arxiv_id']} 미리보기", e)
-    if col_del.button("🗑️ 삭제", key=f"arxiv_del_{p['arxiv_id']}", width="stretch"):
+            show_error(f"{selected['arxiv_id']} 미리보기", e)
+    if col_del.button("🗑️ 삭제", key="arxiv_del", width="stretch"):
         try:
-            ax.delete_paper(p["arxiv_id"])
+            ax.delete_paper(selected["arxiv_id"])
         except Exception as e:
-            show_error(f"{p['arxiv_id']} 삭제", e)
+            show_error(f"{selected['arxiv_id']} 삭제", e)
         else:
-            if st.session_state.get("arxiv_preview", {}).get("arxiv_id") == p["arxiv_id"]:
+            if st.session_state.get("arxiv_preview", {}).get("arxiv_id") == selected["arxiv_id"]:
                 st.session_state.pop("arxiv_preview")  # 지운 논문의 미리보기도 닫음
             st.rerun()
 

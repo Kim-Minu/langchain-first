@@ -415,12 +415,21 @@ def test_page_search_and_preview(tmp_path, monkeypatch):
         assert not at.exception
         at.text_input[0].input("rag")
         at.button[0].click().run()
-        [table] = at.get("dataframe")  # 검색 결과 표 (data_editor)
-        assert list(table.value["PDF"]) == ["http://arxiv.org/pdf/2401.00001v1"]  # 행마다 원문 PDF 링크 (R1)
+        search_table, stored_table = (e.value for e in at.get("dataframe"))  # 검색 결과 · 저장된 논문 표
+        table = search_table
+        assert list(table["PDF"]) == ["http://arxiv.org/pdf/2401.00001v1"]  # 행마다 원문 PDF 링크 (R1)
         assert downloaded == []  # 검색만으로는 내려받지 않음
 
-        # 저장된 논문 행의 미리보기 → 받아 둔 파일이 없으면 기록의 PDF 주소로 받아 화면 안에 표시 (R7)
-        at.button(key="arxiv_view_2401.00002v1").click().run()
+        # 저장된 논문 표: 행을 고르기 전엔 미리보기 · 삭제 버튼이 없음
+        grid_key = "arxiv_stored_grid_" + hashlib.md5(b"2401.00002v1").hexdigest()[:8]
+        assert not [b for b in at.button if b.key in ("arxiv_view", "arxiv_del")]
+        assert list(stored_table["arXiv ID"]) == ["2401.00002v1"]
+        assert list(stored_table["PDF"]) == ["https://arxiv.org/pdf/2401.00002v1"]
+
+        # 행 선택 → 미리보기: 받아 둔 파일이 없으면 기록의 PDF 주소로 받아 화면 안에 표시 (R7)
+        at.session_state[grid_key] = {"selection": {"rows": [0], "columns": [], "cells": []}}
+        at.run()
+        at.button(key="arxiv_view").click().run()
         assert not at.exception
         assert downloaded == [("2401.00002v1", "https://arxiv.org/pdf/2401.00002v1")]
         assert at.session_state["arxiv_preview"] == {"arxiv_id": "2401.00002v1", "path": str(tmp_path / "preview.pdf")}
@@ -431,8 +440,8 @@ def test_page_search_and_preview(tmp_path, monkeypatch):
         assert "arxiv_preview" not in at.session_state and not at.get("bidi_component")
 
         # 미리보던 논문을 삭제하면 미리보기도 함께 닫힘 (R11)
-        at.button(key="arxiv_view_2401.00002v1").click().run()
-        at.button(key="arxiv_del_2401.00002v1").click().run()
+        at.button(key="arxiv_view").click().run()
+        at.button(key="arxiv_del").click().run()
     assert not at.exception
     assert deleted == ["2401.00002v1"]
     assert "arxiv_preview" not in at.session_state and not at.get("bidi_component")
