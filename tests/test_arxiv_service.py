@@ -391,18 +391,24 @@ def test_page_search_and_preview(tmp_path, monkeypatch):
         authors=[arxiv.Result.Author("Kim")], summary="s",
         links=[arxiv.Result.Link("http://arxiv.org/pdf/2401.00001v1", title="pdf")],
     )
-    downloaded = []
+    stored = [{"arxiv_id": "2401.00002v1", "title": "Stored Paper", "chunks": 3, "pdf_kind": "text", "generation": "g"}]
+    downloaded, deleted = [], []
 
     def fake_download(paper):
-        downloaded.append(paper.arxiv_id)
+        downloaded.append((paper.arxiv_id, paper.pdf_url))
         path = tmp_path / "preview.pdf"
         path.write_bytes(make_pdf(["hello"]))
         return path
 
-    monkeypatch.setattr(ax, "list_indexed_papers", lambda *a, **k: [])
+    def fake_delete(arxiv_id):
+        deleted.append(arxiv_id)
+        stored.clear()
+
+    monkeypatch.setattr(ax, "list_indexed_papers", lambda *a, **k: list(stored))
+    monkeypatch.setattr(ax, "download_pdf", fake_download)
+    monkeypatch.setattr(ax, "delete_paper", fake_delete)
     # ADC 인증 없는 환경에서도 돌도록 화면이 만드는 Gemini 임베딩을 가짜로
     monkeypatch.setattr(rag, "create_embeddings", lambda *a, **k: FakeEmbeddings())
-    monkeypatch.setattr(ax, "download_pdf", fake_download)
     # AppTest는 페이지 파일을 진입점으로 실행해 사이드바의 다른 페이지 링크를 찾지 못하므로 링크만 무시
     with mock.patch("streamlit.page_link"), mock.patch("arxiv.Client.results", lambda self, s: iter([result])):
         at = AppTest.from_file(str(Path(__file__).parents[1] / "rag_app/pages/arxiv_qa.py"), default_timeout=60).run()
@@ -410,21 +416,26 @@ def test_page_search_and_preview(tmp_path, monkeypatch):
         at.text_input[0].input("rag")
         at.button[0].click().run()
         [table] = at.get("dataframe")  # 검색 결과 표 (data_editor)
-        assert list(table.value["PDF"]) == ["http://arxiv.org/pdf/2401.00001v1"]  # 행마다 원문 PDF 링크
-        next(b for b in at.button if b.label == "미리보기").click().run()
+        assert list(table.value["PDF"]) == ["http://arxiv.org/pdf/2401.00001v1"]  # 행마다 원문 PDF 링크 (R1)
+        assert downloaded == []  # 검색만으로는 내려받지 않음
 
+        # 저장된 논문 행의 미리보기 → 받아 둔 파일이 없으면 기록의 PDF 주소로 받아 화면 안에 표시 (R7)
+        at.button(key="arxiv_view_2401.00002v1").click().run()
         assert not at.exception
-        assert downloaded == ["2401.00001v1"]  # 받지 않은 논문은 미리보기 때 다운로드
-        assert at.session_state["arxiv_preview"] == {"arxiv_id": "2401.00001v1", "path": str(tmp_path / "preview.pdf")}
+        assert downloaded == [("2401.00002v1", "https://arxiv.org/pdf/2401.00002v1")]
+        assert at.session_state["arxiv_preview"] == {"arxiv_id": "2401.00002v1", "path": str(tmp_path / "preview.pdf")}
         assert at.get("bidi_component")  # st.pdf 뷰어
 
-        # 닫기 버튼을 누르면 뷰어가 사라지고 상태도 지워짐
-        next(b for b in at.button if b.label == "✕ 미리보기 닫기").click().run()
-    assert not at.exception
-    assert "arxiv_preview" not in at.session_state
-    assert not at.get("bidi_component")
-    assert not [b for b in at.button if b.label == "✕ 미리보기 닫기"]
+        # 닫기 → 뷰어 · 상태 제거
+        at.button(key="arxiv_preview_close").click().run()
+        assert "arxiv_preview" not in at.session_state and not at.get("bidi_component")
 
+        # 미리보던 논문을 삭제하면 미리보기도 함께 닫힘 (R11)
+        at.button(key="arxiv_view_2401.00002v1").click().run()
+        at.button(key="arxiv_del_2401.00002v1").click().run()
+    assert not at.exception
+    assert deleted == ["2401.00002v1"]
+    assert "arxiv_preview" not in at.session_state and not at.get("bidi_component")
 
 def test_save_to_store_still_works_for_normal_collection(collection):
     # 보호 장치를 넣은 뒤에도 일반 컬렉션은 기존처럼 비우고 다시 저장됨

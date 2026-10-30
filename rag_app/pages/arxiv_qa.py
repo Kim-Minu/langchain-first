@@ -3,7 +3,7 @@
 
 1. 검색: 키워드 → arXiv 논문 목록 (제목 · 저자 · 게시일 · 요약)
 2. 저장: 고른 논문 PDF 다운로드 → 청크 → 임베딩 → 공용 컬렉션(config.ARXIV_COLLECTION)에 누적
-3. 미리보기: 검색 결과 · 저장된 논문의 PDF를 화면에서 확인 (받지 않은 논문은 먼저 다운로드)
+3. 저장된 논문: 목록 · PDF 미리보기 · 삭제 (검색 결과는 표의 PDF 링크로 새 탭에서)
 4. 질의: 저장된 논문 전체 또는 고른 논문만 검색해 답변 + 근거 청크
 
 로직은 rag_app/arxiv_service.py, 이 파일은 화면만 담당한다.
@@ -115,60 +115,58 @@ if papers:
 stored = ax.list_indexed_papers()
 
 # ---------------------------------------------------------------------------
-# 3. PDF 미리보기
+# 3. 저장된 논문 (미리보기 · 삭제)
 # ---------------------------------------------------------------------------
-# 검색 결과와 저장된 논문을 함께 후보로 (검색 결과 쪽 정보를 우선)
-candidates = {p["arxiv_id"]: ax.paper_from_record(p) for p in stored}
-candidates.update({p.arxiv_id: p for p in papers})
-if candidates:
-    step_header("3", "PDF 미리보기", "저장 전에 내용을 확인할 수 있습니다. 아직 받지 않은 논문은 먼저 다운로드합니다.")
-    col_pick, col_btn = st.columns([5, 1])
-    preview_id = col_pick.selectbox(
-        "미리볼 논문", list(candidates), format_func=lambda i: f"{i} · {candidates[i].title}", key="arxiv_preview_pick",
-    )
-    col_btn.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-    if col_btn.button("미리보기", width="stretch"):
+# 검색 결과는 표의 PDF 링크로 새 탭에서, 저장된 논문은 여기서 화면 안에 미리봄
+step_header(
+    "3", "저장된 논문",
+    f"{len(stored)}편. 삭제하면 청크와 기록이 지워지고, 받아 둔 PDF는 남아 다시 저장할 때 내려받지 않습니다.",
+)
+if not stored:
+    st.info("저장된 논문이 없습니다. 위에서 검색해 저장하세요.")
+    st.stop()
+
+for p in stored:
+    col_info, col_view, col_del = st.columns([6, 1, 1])
+    kind = PDF_KIND_LABEL.get(p.get("pdf_kind", "text"), "")
+    col_info.markdown(f"**{p['arxiv_id']}** · {p['title']}  \n청크 {p['chunks']}개 · {kind} · {p.get('indexed_at', '')}")
+    if col_view.button("📄 미리보기", key=f"arxiv_view_{p['arxiv_id']}", width="stretch"):
         try:
             with st.spinner("PDF 준비 중..."):
-                path = ax.download_pdf(candidates[preview_id])  # 받아 둔 파일이 있으면 그대로 씀
+                path = ax.download_pdf(ax.paper_from_record(p))  # 받아 둔 파일이 있으면 그대로, 없으면 다시 받음
             # 다른 위젯을 눌러도 유지되게 저장하되, 어떤 논문의 파일인지 함께 기록
-            st.session_state["arxiv_preview"] = {"arxiv_id": preview_id, "path": str(path)}
+            st.session_state["arxiv_preview"] = {"arxiv_id": p["arxiv_id"], "path": str(path)}
         except Exception as e:
-            show_error(f"{preview_id} 미리보기", e)
-    # 변수 이름을 shown으로 — preview는 ui_common에서 가져온 요약 함수 이름
-    shown = st.session_state.get("arxiv_preview")
-    # 다른 논문을 고르면 이전 논문의 PDF를 그 이름 아래 보여 주지 않음
-    if shown and shown["arxiv_id"] == preview_id and Path(shown["path"]).exists():
-        if st.button("✕ 미리보기 닫기", key="arxiv_preview_close"):
-            st.session_state.pop("arxiv_preview", None)
+            show_error(f"{p['arxiv_id']} 미리보기", e)
+    if col_del.button("🗑️ 삭제", key=f"arxiv_del_{p['arxiv_id']}", width="stretch"):
+        try:
+            ax.delete_paper(p["arxiv_id"])
+        except Exception as e:
+            show_error(f"{p['arxiv_id']} 삭제", e)
+        else:
+            if st.session_state.get("arxiv_preview", {}).get("arxiv_id") == p["arxiv_id"]:
+                st.session_state.pop("arxiv_preview")  # 지운 논문의 미리보기도 닫음
             st.rerun()
-        st.pdf(shown["path"], height=800)
+
+# 변수 이름을 shown으로 — preview는 ui_common에서 가져온 요약 함수 이름
+shown = st.session_state.get("arxiv_preview")
+stored_titles = {p["arxiv_id"]: p["title"] for p in stored}
+if shown and shown["arxiv_id"] in stored_titles and Path(shown["path"]).exists():
+    col_title, col_close = st.columns([6, 2])
+    col_title.markdown(f"**미리보기** · {shown['arxiv_id']} · {stored_titles[shown['arxiv_id']]}")
+    if col_close.button("✕ 미리보기 닫기", key="arxiv_preview_close", width="stretch"):
+        st.session_state.pop("arxiv_preview", None)
+        st.rerun()
+    st.pdf(shown["path"], height=800)
 
 # ---------------------------------------------------------------------------
 # 4. 질의
 # ---------------------------------------------------------------------------
 step_header(
     "4", "논문 질의",
-    f"저장된 논문 {len(stored)}편. 대상을 고르지 않으면 전체에서 찾습니다. "
+    "대상을 고르지 않으면 전체에서 찾습니다. "
     f"의미 검색 · BM25 키워드 검색 각 {config.ARXIV_CANDIDATES}개를 합쳐 상위 {config.ARXIV_TOP_K}개를 근거로 씁니다.",
 )
-if not stored:
-    st.info("저장된 논문이 없습니다. 위에서 검색해 저장하세요.")
-    st.stop()
-
-with st.expander(f"저장된 논문 관리 ({len(stored)}편)"):
-    st.caption("삭제하면 청크와 기록이 지워집니다. 받아 둔 PDF는 남아 있어 다시 저장할 때 내려받지 않습니다.")
-    for p in stored:
-        col_info, col_del = st.columns([6, 1])
-        kind = PDF_KIND_LABEL.get(p.get("pdf_kind", "text"), "")
-        col_info.markdown(f"**{p['arxiv_id']}** · {p['title']}  \n청크 {p['chunks']}개 · {kind} · {p.get('indexed_at', '')}")
-        if col_del.button("🗑️ 삭제", key=f"arxiv_del_{p['arxiv_id']}", width="stretch"):
-            try:
-                ax.delete_paper(p["arxiv_id"])
-            except Exception as e:
-                show_error(f"{p['arxiv_id']} 삭제", e)
-            else:
-                st.rerun()
 
 titles = {p["arxiv_id"]: f"{p['arxiv_id']} · {p['title']}" for p in stored}
 targets = st.multiselect("대상 논문", list(titles), format_func=titles.get)
