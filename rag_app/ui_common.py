@@ -104,6 +104,7 @@ def render_left_menu() -> None:
         # 페이지 이동 링크를 직접 배치
         st.page_link("app.py", label="PDF RAG 실습", icon="📄")
         st.page_link("pages/ocr_eval.py", label="OCR · RAG 평가", icon="🔎")
+        st.page_link("pages/arxiv_qa.py", label="arXiv 논문 질의", icon="📚")
         st.page_link("pages/benchmark.py", label="LLM 성능 벤치마크", icon="⚡")
         st.page_link("pages/billing_dashboard.py", label="과금 대시보드", icon="💰")
         st.divider()
@@ -175,7 +176,8 @@ def render_header_toolbar(page: str = "main") -> Settings:
                     step=1, key="cfg_top_k", help="검색할 청크 개수",
                 )
             with col_coll:
-                stored = rag.list_stored_collections()
+                # arXiv 논문 컬렉션은 여기서 저장하면 통째로 비워지므로 목록에서 뺌 (논문 화면 전용)
+                stored = [c for c in rag.list_stored_collections() if not rag.is_paper_collection(c["metadata"])]
                 stored_names = [c["name"] for c in stored]
                 current = st.session_state.get("cfg_collection", config.COLLECTION_NAME)
 

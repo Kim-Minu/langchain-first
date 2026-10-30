@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.11,<3.13"
 dependencies = [
+    "arxiv>=4.0.2",
     "datasets>=5.1.0",
     "deepagents>=0.7.29",
     "langchain>=1.4.6",
@@ -21,7 +22,8 @@ dependencies = [
     "pypdf>=6.21.2",
     "python-dotenv>=1.2.4",
     "ragas>=0.4.3",
-    "streamlit>=1.66.1",
+    "rank-bm25>=0.2.2",
+    "streamlit[pdf]>=1.66.1",
 ]
 
 [project.scripts]
@@ -30,3 +32,13 @@ langchain-first = "langchain_first:main"
 [build-system]
 requires = ["uv_build>=0.13.4,<0.14.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+# 기존 예제 폴더의 스크립트형 test_*.py는 수집하지 않음
+testpaths = ["tests"]
+pythonpath = ["."]

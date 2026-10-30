@@ -226,6 +226,8 @@ with tab_index:
             try:
                 if not rag.pdf_name_is_valid(uploaded.name):
                     raise ValueError("PDF 파일만 업로드할 수 있습니다.")
+                if rag.is_paper_collection(rag.get_collection_info(target_collection)):  # OCR · 임베딩 비용 전에 거부
+                    raise ValueError(f"`{target_collection}`은 arXiv 논문 전용 컬렉션입니다. 다른 이름을 쓰세요.")
                 data = uploaded.getvalue()
                 file_hash = rag.file_sha256(data)
                 index_key = rag.make_index_key(file_hash, content_settings)
@@ -381,7 +383,8 @@ with tab_index:
                 show_error("저장 결과 조회", e)
 
     st.divider()
-    stored_colls = rag.list_stored_collections()
+    # arXiv 논문 컬렉션은 논문 화면 전용 — 여기서 한 번에 지우지 못하게 목록에서 뺌
+    stored_colls = [c for c in rag.list_stored_collections() if not rag.is_paper_collection(c["metadata"])]
     with st.expander(f"🗂️ PostgreSQL 컬렉션 목록 및 삭제 관리 ({len(stored_colls)}개)", expanded=False):
         if not stored_colls:
             st.caption("저장된 컬렉션이 없습니다.")
