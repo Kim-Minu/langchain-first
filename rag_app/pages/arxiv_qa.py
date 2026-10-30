@@ -72,6 +72,7 @@ if papers:
             "저자": ", ".join(p.authors[:3]) + (" 외" if len(p.authors) > 3 else ""),
             "게시일": p.published,
             "요약": preview(p.summary, 200),
+            "PDF": p.pdf_url,  # 저장하지 않고 원문을 새 탭에서 바로 확인
         }
         for p in papers
     ])
@@ -80,6 +81,7 @@ if papers:
         hide_index=True,
         width="stretch",
         disabled=[c for c in table.columns if c != "선택"],
+        column_config={"PDF": st.column_config.LinkColumn("PDF", display_text="열기 ↗", help="arXiv PDF를 새 탭에서 엽니다")},
         key=f"arxiv_pick_{st.session_state.get('arxiv_search_no', 0)}",
     )
     picked = [p for p, chosen in zip(papers, edited["선택"]) if chosen]

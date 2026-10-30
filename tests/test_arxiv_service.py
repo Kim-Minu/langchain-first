@@ -409,7 +409,8 @@ def test_page_search_and_preview(tmp_path, monkeypatch):
         assert not at.exception
         at.text_input[0].input("rag")
         at.button[0].click().run()
-        assert at.get("arrow_data_frame") or at.get("dataframe")  # 검색 결과 표
+        [table] = at.get("dataframe")  # 검색 결과 표 (data_editor)
+        assert list(table.value["PDF"]) == ["http://arxiv.org/pdf/2401.00001v1"]  # 행마다 원문 PDF 링크
         next(b for b in at.button if b.label == "미리보기").click().run()
 
         assert not at.exception
